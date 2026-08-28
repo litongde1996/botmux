@@ -1,21 +1,76 @@
 /**
- * Automates the Open Platform half of `botmux setup` after the PersonalAgent
- * app has been created by the Feishu SDK registerApp flow.
+ * Feishu Open Platform automation used by `botmux setup`.
  *
- * Follow-up for PR review: the current end-to-end setup can still ask for two
- * QR scans: one for SDK app creation and one for this Web session. These can be
- * collapsed in a later iteration by making the Feishu Web session the primary
- * path for app creation as well: Web QR login -> create/find app -> read
- * AppID/AppSecret -> write bots.json -> configure scopes/redirect/version.
- * With a cached ~/.botmux/feishu-session.json, that path can create another bot
- * with no QR scan at all. Keep the current SDK creation path as the stable
- * fallback until that flow is fully verified.
+ * The primary Feishu path now uses one reusable Web session for the whole flow:
+ * create app -> read AppID/AppSecret -> configure scopes/events/redirect ->
+ * create and publish a version. The official SDK registerApp device flow stays
+ * available as a fallback (notably for Lark international tenants).
  */
+import { randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import qrcode from 'qrcode-terminal';
+import { registerBotmuxRedirectUrlCollector, VC_MEETING_BOT_EVENTS } from './verify-permissions.js';
+import { readGlobalConfig } from '../global-config.js';
+import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from '../platform/binding.js';
+import {
+  parseOnlineVisibility,
+  VisibilityParseError,
+  type VisibilitySuggest,
+} from './open-platform-visibility.js';
+
+/**
+ * All non-VC events (application identity) that the botmux dispatcher consumes.
+ * `card.action.trigger` is intentionally NOT here: the Open Platform treats it
+ * as a "callback" configured via `/developers/v1/callback/*`, see
+ * BOT_BASELINE_CALLBACKS.
+ */
+export const BOT_BASELINE_APP_EVENTS = [
+  'im.message.receive_v1',
+  'im.chat.member.bot.added_v1',
+  'im.chat.member.bot.deleted_v1',
+  'drive.notice.comment_add_v1',
+  'im.message.reaction.created_v1',
+  'im.message.reaction.deleted_v1',
+] as const;
+
+/**
+ * Best-effort app events: subscribed alongside the baseline but NEVER part of
+ * the fail-closed verification (missingBaselineEvents / MANAGED_VERIFIED_EVENT_COUNT).
+ * Used for enhancements that degrade gracefully when unsubscribed — membership
+ * change events only drive chatStatsCache invalidation, whose 5-min TTL is the
+ * documented fallback. Some tenants cannot grant the underlying member-read
+ * scopes for user events; hard-requiring them would block bot onboarding.
+ */
+export const BOT_OPTIONAL_APP_EVENTS = [
+  'im.chat.member.user.added_v1',
+  'im.chat.member.user.deleted_v1',
+] as const;
+
+/** 缺了它 daemon 完全收不到消息——回读确认失败时整个自动配置 fail-closed。 */
+export const BOT_CRITICAL_APP_EVENTS = ['im.message.receive_v1'] as const;
+
+/** 卡片交互回调。缺了它卡片按钮点击无响应,同样 fail-closed。 */
+export const BOT_BASELINE_CALLBACKS = ['card.action.trigger'] as const;
+
+/** 开放平台「使用长连接接收事件/回调」对应的 mode 值。 */
+export const LONG_CONNECTION_EVENT_MODE = 4;
+
+const VC_MEETING_EVENT_IDENTITY = {
+  'vc.bot.meeting_invited_v1': 'app',
+  'vc.bot.meeting_activity_v1': 'app',
+  'vc.bot.meeting_ended_v1': 'app',
+  'vc.meeting.participant_meeting_joined_v1': 'user',
+} as const satisfies Record<(typeof VC_MEETING_BOT_EVENTS)[number], 'app' | 'user'>;
+
+export const VC_MEETING_APP_EVENTS = VC_MEETING_BOT_EVENTS.filter(
+  eventName => VC_MEETING_EVENT_IDENTITY[eventName] === 'app',
+);
+export const VC_MEETING_USER_EVENTS = VC_MEETING_BOT_EVENTS.filter(
+  eventName => VC_MEETING_EVENT_IDENTITY[eventName] === 'user',
+);
 
 export const BOTMUX_REDIRECT_URL = 'http://127.0.0.1:9768/callback';
 const FEISHU_ACCOUNTS_ORIGIN = 'https://accounts.feishu.cn';
@@ -39,6 +94,15 @@ export interface StoredCookie {
   hostOnly: boolean;
   expiresAt?: number;
   sameSite?: string;
+}
+
+/** 当前开放平台 Web session 对应的人与企业。创建前用它防止复用错租户。 */
+export interface FeishuWebSessionIdentity {
+  userId: string;
+  userName: string;
+  email?: string;
+  tenantId: string;
+  tenantName: string;
 }
 
 export interface ScopeManifest {
@@ -70,6 +134,24 @@ export type OpenPlatformAutomationResult =
       scopeCount: number;
       skippedScopeCount: number;
       scopeWarning?: string;
+      subscribedEventCount: number;
+      eventWarning?: string;
+      /** 回读后仍缺失的 VC 会议事件。普通建 bot 不阻断,VC listener 保存前必须为空。 */
+      missingVcEvents: string[];
+      /** 回读确认事件接收方式已是长连接(ok:true 时恒为 true,显式带回供门函数统一判定)。 */
+      eventModeReady: boolean;
+      /**
+       * redirect 白名单是否写成功。白名单缺失 = authorize 直接 20029 硬失败
+       * (群聊模式 / 会话群标签 / `/login` 全部授权不了),但它不阻断建 bot,
+       * 所以必须显式带回,让调用方把「还差这一步」翻译成人话。
+       */
+      redirectConfigured: boolean;
+      /** redirect 白名单写入失败的原因(仅 redirectConfigured=false 时有)。 */
+      redirectWarning?: string;
+      /** Managed onboarding only: exact same-session event mode readback. */
+      eventMode?: number;
+      /** Managed onboarding only: exact baseline event + callback count read back before session cleanup. */
+      verifiedEventCount?: number;
       versionId?: string;
     }
   | {
@@ -82,11 +164,33 @@ export type OpenPlatformAutomationResult =
         | 'qr_expired'
         | 'timeout'
         | 'missing_csrf'
+        | 'owner_session_mismatch'
         | 'scope_mapping_failed'
+        | 'event_verification_failed'
+        | 'version_verification_failed'
+        | 'visibility_unreadable'
         | 'network'
         | 'api_error';
       message: string;
       sessionFile?: string;
+      /** Number of events successfully subscribed (0 when event update failed before downstream error). */
+      subscribedEventCount?: number;
+      /** Warning from event subscription attempt, if any. */
+      eventWarning?: string;
+      /** 回读后仍缺失的 VC 会议事件(走到订阅阶段才有)。 */
+      missingVcEvents?: string[];
+      /** 事件接收方式是否回读确认为长连接(走到订阅阶段才有;早期失败为 undefined)。 */
+      eventModeReady?: boolean;
+      /** redirect 白名单是否写成功(csrf 就位后立刻尝试,失败不阻断本流程)。 */
+      redirectConfigured?: boolean;
+      /** redirect 白名单写入失败的原因。 */
+      redirectWarning?: string;
+      /** Managed onboarding exact event-mode ACK, preserved across later scope propagation failure. */
+      eventMode?: number;
+      /** Managed onboarding exact baseline count ACK, preserved across later scope propagation failure. */
+      verifiedEventCount?: number;
+      /** Exact published version ACK, preserved across later scope propagation failure. */
+      versionId?: string;
     };
 
 export interface OpenPlatformAutomationOptions {
@@ -95,11 +199,29 @@ export interface OpenPlatformAutomationOptions {
   sessionFilePath?: string;
   bytedcliFallbackSessionFilePath?: string;
   disableBytedcliFallback?: boolean;
+  /** Ignore any shared cached account and require the exact App owner to scan. */
+  forceQrLogin?: boolean;
+  /** Reuse a valid cache or fail instead of presenting another QR. */
+  disableQrLogin?: boolean;
+  /** Require all baseline events/callbacks and a published version to be proven before managed activation. */
+  requireVerifiedEvents?: boolean;
+  /**
+   * 「这个 app 是本次流程刚刚创建出来的」。**只有** setup / onboarding 的建应用链路
+   * 能传 true。
+   *
+   * 唯一作用：允许 redirect 白名单在**读不到线上现值时**退化成覆盖写。刚建的应用
+   * 白名单必然为空，覆盖不掉任何用户条目；对存量应用盲写则会静默清掉用户手配的
+   * 回调地址（见 {@link WriteRedirectWhitelistOptions.allowBlindWrite}）。
+   * 权限自愈 / VC 事件补订阅 / 批量修复这些跑在存量应用上的链路一律不传。
+   */
+  appJustCreated?: boolean;
   fetchImpl?: typeof fetch;
   scopeManifest?: ScopeManifest;
   pollIntervalMs?: number;
   maxWaitMs?: number;
   onQrCode?: (info: { qrText: string; qrPayload: string }) => void | Promise<void>;
+  /** Emitted once only after Feishu reports this exact QR as scanned. */
+  onQrScanConfirmed?: (info: { confirmedAt: number }) => void | Promise<void>;
   onStatus?: (message: string) => void | Promise<void>;
 }
 
@@ -127,12 +249,36 @@ export interface FeishuWebSessionOptions {
   sessionFilePath?: string;
   bytedcliFallbackSessionFilePath?: string;
   disableBytedcliFallback?: boolean;
+  /**
+   * Ignore cached sessions and require a fresh QR login. Dashboard onboarding
+   * uses this so the user always sees which account is authorizing the new app;
+   * the resulting session is still cached for the remaining setup steps.
+   */
+  forceQrLogin?: boolean;
+  /** Reuse a valid cache or fail; never present another QR code. */
+  disableQrLogin?: boolean;
   fetchImpl?: typeof fetch;
   pollIntervalMs?: number;
   maxWaitMs?: number;
   onQrCode?: (info: { qrText: string; qrPayload: string }) => void | Promise<void>;
+  /** Emitted once only after polling observes Feishu status=2 for this QR. */
+  onQrScanConfirmed?: (info: { confirmedAt: number }) => void | Promise<void>;
   onStatus?: (message: string) => void | Promise<void>;
 }
+
+export type FeishuOpenPlatformSessionInspectionResult =
+  | {
+      ok: true;
+      source: FeishuWebSessionSource;
+      identity: FeishuWebSessionIdentity;
+      sessionFile: string;
+    }
+  | {
+      ok: false;
+      reason: FeishuWebSessionFailureReason | 'missing_csrf' | 'identity_unavailable' | 'network';
+      message: string;
+      sessionFile?: string;
+    };
 
 
 export function parseSetupOpenPlatformAutoFlag(argv: string[]): boolean {
@@ -219,6 +365,34 @@ export function extractOpenPlatformCsrfToken(html: string): string | null {
   return match?.[2] ?? null;
 }
 
+/**
+ * 开发者后台把当前登录人写入 `window.user = {...}`。只提取创建前需要展示和
+ * 比对的稳定字段，不把头像、功能开关等整段页面状态带进 Dashboard API。
+ */
+export function extractOpenPlatformSessionIdentity(html: string): FeishuWebSessionIdentity | null {
+  const marker = /\bwindow\.user\s*=\s*/g;
+  const match = marker.exec(html);
+  if (!match) return null;
+  const start = match.index + match[0].length;
+  const json = extractBalancedJsonObject(html, start);
+  if (!json) return null;
+  let user: Record<string, unknown>;
+  try {
+    user = asRecord(JSON.parse(json));
+  } catch {
+    return null;
+  }
+  const userId = pickString(user, ['id', 'userId', 'user_id']);
+  const userName = pickString(user, ['name', 'userName', 'user_name'])
+    ?? pickString(asRecord(user.displayName), ['value']);
+  const tenantId = pickString(user, ['tenantId', 'tenant_id']);
+  const tenantName = pickString(asRecord(user.tenantDisplayName), ['value'])
+    ?? pickString(user, ['tenantName', 'tenant_name']);
+  if (!userId || !userName || !tenantId || !tenantName) return null;
+  const email = pickString(user, ['email']);
+  return { userId, userName, ...(email ? { email } : {}), tenantId, tenantName };
+}
+
 export function extractOpenPlatformScopeEntries(payload: unknown): OpenPlatformScopeEntry[] {
   const out: OpenPlatformScopeEntry[] = [];
   collectScopeEntries(payload, undefined, out);
@@ -256,41 +430,427 @@ export function buildScopeUpdatePayload(appId: string, mapped: Pick<MappedScopeI
   };
 }
 
-export function buildSafeSettingPayload(appId: string) {
+export function buildSafeSettingPayload(appId: string, extraRedirectUrls: string[] = []) {
   return {
     clientId: appId,
-    redirectURL: [BOTMUX_REDIRECT_URL],
+    // 默认本机回贴地址 + 可选的 dashboard 自动回调地址（global-config
+    // oauthRedirectBase 场景）。去重保持幂等。
+    // ⚠️ 这里是**全量覆盖**语义：给什么，白名单就是什么。调用方必须先用
+    // {@link writeRedirectWhitelist} 读回线上现值并合并，不要直接拿几条
+    // botmux 自己的地址来调它——那会把用户手配的其它回调地址静默清掉。
+    redirectURL: [...new Set([BOTMUX_REDIRECT_URL, ...extraRedirectUrls])],
   };
 }
 
+/**
+ * botmux 自己知道的、应当出现在 redirect 白名单里的全部回调地址。
+ *
+ * 只有 `http://127.0.0.1:9768/callback` 是常量兜底（粘贴回调那条链路）；另外三条
+ * 都是「本机 dashboard 对外可达基址」的不同来源，存在才追加 `<base>/oauth/callback`：
+ *   • `oauthRedirectBase`（用户在 global-config 里手填的对外基址）
+ *   • `platformMachineBaseUrl()`（接了中心平台 → `https://m-<machineId>.<平台域名>`）
+ *   • `publicReverseProxyBaseUrl()`（自建反代 `BOTMUX_PUBLIC_URL`）
+ * 今天这三条一条都没写进去，正是「配了 oauthRedirectBase 也还是要手动粘贴回调」的根因。
+ *
+ * ⚠️ 故意**不**推导「本机 host:port」：飞书白名单对**非 loopback 的明文 http**
+ * 到底收不收、收了 authorize 时会不会仍报 20029，都还没实测过（见方案 T2）。
+ * 猜一条塞进去，失败时会连累整批写入（虽然有最小集兜底，但白白多一次往返），
+ * 而且 LAN 地址对话题里的其他人本来就不一定可达。等 T2 实测有结论再加。
+ */
+export function collectBotmuxRedirectUrls(): string[] {
+  const urls: string[] = [BOTMUX_REDIRECT_URL];
+  const pushBase = (base: string | null | undefined) => {
+    const trimmed = base?.trim().replace(/\/+$/, '');
+    if (trimmed && /^https?:\/\//.test(trimmed)) urls.push(`${trimmed}/oauth/callback`);
+  };
+  // 三个来源各自独立 try/catch：配置读不动 / 未绑定平台都不该拖垮其它两条。
+  try { pushBase(readGlobalConfig().oauthRedirectBase); } catch { /* config unavailable */ }
+  try { pushBase(platformMachineBaseUrl()); } catch { /* not bound to a platform */ }
+  try { pushBase(publicReverseProxyBaseUrl()); } catch { /* env unavailable */ }
+  return uniqueStrings(urls);
+}
+
+// verify-permissions 的 buildRemainingSteps 要按实际配置列重定向 URL，但它**不能**
+// 反向 import 本模块（本模块在顶层 const 里用它的 VC_MEETING_BOT_EVENTS，静态互引
+// 会 TDZ 崩）。所以由本模块单向把函数注册过去，依赖方向仍是 automation →
+// verify-permissions 一条边。
+registerBotmuxRedirectUrlCollector(collectBotmuxRedirectUrls);
+
+/**
+ * 从 `POST /developers/v1/safe_setting/<appId>` `{}` 的返回里解析现有 redirect 白名单。
+ *
+ * 返回 `null` 表示**没读出来**（端点不存在 / 结构变了 / 报错），与「读到了但是空数组」
+ * 严格区分：前者只能退化成覆盖写（保住 botmux 自己能用），后者可以放心合并。
+ * 实测返回形态（feishu.cn 租户，2026-08）：
+ * `{code:0, data:{allowRefreshToken, ipWhiteList:[], redirectURL:[...], safeServerDomain:[]}}`。
+ */
+export function extractOpenPlatformRedirectUrls(payload: unknown): string[] | null {
+  const root = asRecord(payload);
+  const wrapped = asRecord(root.data);
+  const data = Object.keys(wrapped).length > 0 ? wrapped : root;
+  const raw = data.redirectURL ?? data.redirectUrl ?? data.redirectURLs;
+  if (!Array.isArray(raw)) return null;
+  return uniqueStrings(raw.map(item => (typeof item === 'string' ? item.trim() : '')));
+}
+
+/** `automateOpenPlatformSetup` 内联 postJson / `OpenPlatformApiClient.postJson` 的公共形状。 */
+export type OpenPlatformPostJson = (path: string, body?: unknown) => Promise<unknown>;
+
+export interface RedirectWhitelistWriteResult {
+  /**
+   * • `unchanged`          — 幂等短路没发写请求
+   * • `updated`            — 写了全集
+   * • `updated_fallback`   — 全集被拒、退到最小集
+   * • `skipped_unreadable` — 读不到线上现值且未获盲写授权 → **一次写请求都没发**
+   */
+  status: 'unchanged' | 'updated' | 'updated_fallback' | 'skipped_unreadable';
+  /** 线上现有白名单（读不出来时为 null）。 */
+  existing: string[] | null;
+  /** 本次实际落地（或确认已在线上）的白名单。`skipped_unreadable` 时为空数组。 */
+  redirectUrls: string[];
+  /** `skipped_unreadable` 时的人话说明，由调用方记成 warning。 */
+  warning?: string;
+}
+
+/**
+ * 「这次想写的地址里，有哪几条最终没落在线上」——redirect 白名单**是否算配置成功**的
+ * 唯一判据。
+ *
+ * 纯函数（无 IO、无状态），由 {@link automateOpenPlatformSetup} 与
+ * `open-platform-redirect-repair.ts` 的批量修复**共用同一份结果**：两处各写一份完整性
+ * 判断必然漂移——automation 曾经只特判 `skipped_unreadable`、其余一律报「已配置」，于是
+ * `updated_fallback`（按定义至少漏掉一条 wanted）被假报成成功，用户拿到一个建好了、
+ * 一授权就 20029 的 bot。
+ *
+ * 按**实际落盘结果**逐条核对 `wanted`，而不是特判某个 status：今天只有
+ * `updated_fallback` 会漏条（最小集 = 线上现值 ∪ 本机回调，超出这个范围的 wanted 都被
+ * 丢了），但兜底集的构成一旦调整，只有「拿 wanted 对一遍实际结果」这条判据不会跟着错。
+ *
+ * ⚠️ `skipped_unreadable`（读不到线上现值 → 一次写请求都没发）**不走这条路**：它是
+ * 「没写」而不是「写漏了」，两者的下一步完全不同（前者要先修登录态/权限，后者去后台
+ * 补地址），由两个调用方各自单独特判并给出区分开的措辞。
+ */
+export function missingRedirectUrls(wanted: string[], written: string[]): string[] {
+  const live = new Set(written);
+  return uniqueStrings(wanted).filter(url => !live.has(url));
+}
+
+export interface WriteRedirectWhitelistOptions {
+  /**
+   * 允许「读不出线上现值时直接全量覆盖写」。
+   *
+   * `buildSafeSettingPayload` 是全量覆盖语义，所以盲写 = 把线上白名单替换成
+   * `wanted`。对**存量应用**这会静默清掉用户自己配的回调地址，违反「绝不删用户
+   * 条目」契约；读接口只要抖一下（瞬时网络 / 结构变化 / 权限异常）就会踩到。
+   * 因此默认 false：读不出来就零写入、回 `skipped_unreadable`。
+   *
+   * 只有调用方能**证明这个 app 是本次自动化刚刚创建出来的**（白名单必然为空，
+   * 覆盖不掉任何东西）才允许传 true —— 见 `OpenPlatformAutomationOptions.appJustCreated`。
+   */
+  allowBlindWrite?: boolean;
+}
+
+/**
+ * 读 → 合并 → 写 redirect 白名单，**绝不删用户已有条目**。
+ *
+ * `buildSafeSettingPayload` 是全量覆盖语义，历史实现直接拿 botmux 自己那几条去调，
+ * 于是每次建 bot / 权限自愈都把用户在后台手配的其它回调地址静默清空。这里先读回
+ * 线上现值再取并集。
+ *
+ * ⚠️ **读不出来时默认零写入**（`skipped_unreadable`）。历史实现在这里退化成全量
+ * 覆盖写，等于把「读接口抖了一下」翻译成「清掉用户的自定义回调」——同一个契约违约，
+ * 只是触发条件更隐蔽。只有 {@link WriteRedirectWhitelistOptions.allowBlindWrite}
+ * （调用方能证明 app 是刚创建的）才恢复覆盖写。
+ *
+ * `postJson` 走参数注入而不是闭包捕获，是为了「批量修复存量 bot」能直接复用同一段
+ * 逻辑——那条路径必须走 {@link createOpenPlatformApiClient}（它的 referer 是通用的
+ * `<origin>/app`，可对任意 appId 调用），而不是 `automateOpenPlatformSetup` 里那份
+ * referer 绑死单个 appId 的内联 postJson。
+ *
+ * 写失败时**只在「URL 被 console 判非法」这一类错误上**兜底重试一次「线上现值 ∪
+ * 127.0.0.1 那条」：`wanted` 里某条 URL 的格式被拒时整批会一起失败，最小集能保住
+ * 最核心的粘贴回调链路。网络抖动 / 403 鉴权失败不做第二次改写（见
+ * {@link isRedirectUrlRejectedError}）。两次都失败才抛出，由调用方记成 warning
+ * （不阻断建 bot）。
+ */
+export async function writeRedirectWhitelist(
+  postJson: OpenPlatformPostJson,
+  appId: string,
+  wanted: string[] = collectBotmuxRedirectUrls(),
+  options: WriteRedirectWhitelistOptions = {},
+): Promise<RedirectWhitelistWriteResult> {
+  let existing: string[] | null = null;
+  let readError: string | undefined;
+  try {
+    const payload = await postJson(`/developers/v1/safe_setting/${appId}`, {});
+    existing = extractOpenPlatformRedirectUrls(payload);
+    if (existing === null) readError = '返回体里没有可识别的 redirectURL 数组';
+  } catch (err: any) {
+    // 端点不存在 / 网络抖动 / 403 → 当作读不出来。
+    existing = null;
+    readError = safeErrorMessage(err);
+  }
+
+  if (existing === null && !options.allowBlindWrite) {
+    // 零写入：盲写会把线上白名单整体替换掉，读失败恰恰意味着「不知道线上有什么」。
+    return {
+      status: 'skipped_unreadable',
+      existing: null,
+      redirectUrls: [],
+      warning: `读不到开放平台现有 redirect 白名单（${readError ?? '未知原因'}），为避免覆盖用户自定义回调地址，本次未写入`,
+    };
+  }
+
+  const wantedUrls = uniqueStrings(wanted);
+  if (existing !== null && wantedUrls.every(url => existing!.includes(url))) {
+    // 幂等短路：想要的全在线上了，一次写请求都不发。
+    return { status: 'unchanged', existing, redirectUrls: existing };
+  }
+
+  const merged = existing === null ? wantedUrls : uniqueStrings([...existing, ...wantedUrls]);
+  const mergedPayload = buildSafeSettingPayload(appId, merged);
+  try {
+    await postJson(`/developers/v1/safe_setting/update/${appId}`, mergedPayload);
+    return { status: 'updated', existing, redirectUrls: mergedPayload.redirectURL };
+  } catch (err: any) {
+    // 兜底只针对「某条 URL 被判非法」——网络异常重发同样会失败，403 重发只会再被拒，
+    // 两者都只是白白多打一次 console。
+    if (!isRedirectUrlRejectedError(err)) throw err;
+    const minimalPayload = buildSafeSettingPayload(
+      appId,
+      existing === null ? [] : uniqueStrings([...existing, BOTMUX_REDIRECT_URL]),
+    );
+    // 最小集与刚被拒的全集一样 → 失败与「多余条目」无关，重发同一份没有意义。
+    if (sameRedirectSet(minimalPayload.redirectURL, mergedPayload.redirectURL)) throw err;
+    try {
+      await postJson(`/developers/v1/safe_setting/update/${appId}`, minimalPayload);
+    } catch (fallbackErr: any) {
+      // `cause` 挂首次失败的**原始错误对象**（而不是只把它拼进字符串）：批量修复
+      // 要靠 `OpenPlatformApiError` 的 status/code 把「这个 app 不属于当前登录账号」
+      // （403 / code=10003）与普通写失败分开，字符串里拿不到状态码。首次失败的文案
+      // 不重复拼进 message，交给 safeErrorMessage 顺 cause 链取——否则同一句会出现两遍。
+      throw new Error(
+        `全集与最小集兜底两次写入均失败（最小集: ${safeErrorMessage(fallbackErr)}）`,
+        { cause: err },
+      );
+    }
+    return { status: 'updated_fallback', existing, redirectUrls: minimalPayload.redirectURL };
+  }
+}
+
+function sameRedirectSet(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  const set = new Set(a);
+  return b.every(item => set.has(item));
+}
+
+/**
+ * 主题词：这句报错在说「某个 URL / 回调地址」。
+ * 单独出现不构成拒绝（`redirect rate limited` 也含 redirect）。
+ */
+const REDIRECT_URL_SUBJECT_KEYWORDS = [
+  'url', 'uri', 'redirect', 'callback', '回调', '重定向', '链接',
+];
+
+/**
+ * 拒绝词：这句报错在说「它不合法 / 格式不对 / 不被接受」。
+ * 同样单独出现不构成拒绝（`invalid csrf token` 也含 invalid）。
+ */
+const REDIRECT_URL_REJECTION_KEYWORDS = [
+  'invalid', 'illegal', 'malformed', 'format', 'not allowed', 'not supported', 'unsupported',
+  '非法', '不合法', '格式', '不支持', '不允许',
+];
+
+/**
+ * 把一张关键词表编译成匹配函数：**英文/ASCII 词按词边界（独立单词）匹配，中文词按子串**。
+ *
+ * 英文必须卡词边界，否则普通单词内部的片段会被当成命中，实测三例：
+ *   - `security token invalid`：`security` 里含 `uri`（主题词）+ `invalid`（拒绝词）
+ *   - `invalid operation during request`：`during` 里含 `uri`
+ *   - `callback information unavailable`：`information` 里含 `format`
+ * 三句都与「白名单里有条非法 URL」毫无关系，裸 `includes` 却会让 botmux 再改一次
+ * 线上安全设置。多词短语（`not allowed`）按整条短语卡首尾词边界；结尾允许一个复数
+ * `s`（`one of the urls is invalid` 仍算主题命中），词内片段依旧不算。
+ *
+ * 中文没有词边界概念（`回调地址非法` 本就连写，`\b` 在中文串里也失去意义），继续 includes。
+ * 大小写不敏感沿用旧行为：ASCII 正则带 `i`，中文无大小写之分。
+ */
+function compileKeywordMatcher(keywords: string[]): (message: string) => boolean {
+  // 纯 ASCII 可打印字符 = 英文单词/短语；含中文的走 includes。
+  const isAscii = (keyword: string) => /^[\x20-\x7e]+$/.test(keyword);
+  // 关键词表里目前没有正则元字符，仍转义一次，免得以后加词时静默变成正则。
+  const asciiWords = keywords.filter(isAscii).map(word => word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  const cjkKeywords = keywords.filter(keyword => !isAscii(keyword));
+  const wordPattern = asciiWords.length > 0
+    ? new RegExp(`\\b(?:${asciiWords.join('|')})s?\\b`, 'i')
+    : null;
+  return (message: string) => (wordPattern?.test(message) ?? false)
+    || cjkKeywords.some(keyword => message.includes(keyword));
+}
+
+const matchesRedirectUrlSubject = compileKeywordMatcher(REDIRECT_URL_SUBJECT_KEYWORDS);
+const matchesRedirectUrlRejection = compileKeywordMatcher(REDIRECT_URL_REJECTION_KEYWORDS);
+
+/**
+ * 判断一次 `safe_setting/update` 失败是不是「白名单里某条 URL 被 console 判非法」——
+ * 只有这一类才值得用最小集再写一次。
+ *
+ * ⚠️ 开放平台没有公开这个端点的错误码表，仓库里也没有实测记录（截至本次改动），
+ * 所以做不到「按 code 精确判定」。这里按**保守**顺序判：
+ *   1. 传输层失败（fetch failed / ECONNRESET…）→ false。重发只会再失败一次。
+ *   2. HTTP 401/403 或 console 的 owner 拒绝码 → false。这是鉴权问题，与写什么无关，
+ *      重发还会被拒，而且会把 `not_owned` 的判定链拉长。
+ *   3. HTTP 408/409/429 与所有 5xx → false。超时 / 冲突 / 限流 / 服务端故障都与
+ *      「写了什么」无关，立刻改小重发只会再吃一次限流或再撞一次冲突。
+ *   4. 其余（含 `code!=0` 的业务拒绝）→ **主题词 AND 拒绝词双命中**才算：文案里既要
+ *      出现 url/uri/redirect/callback/回调/重定向/链接 这类**说的是地址**的词，又要出现
+ *      invalid/illegal/malformed/format/not allowed/unsupported/非法/格式/不支持 这类
+ *      **说它被拒**的词。英文词必须是**独立单词**（词边界），不认词内片段——
+ *      `security token invalid`（security 含 uri）、`invalid operation during request`
+ *      （during 含 uri）、`callback information unavailable`（information 含 format）
+ *      这三句实测都会被裸 `includes` 判成双命中，见 {@link compileKeywordMatcher}。
+ *
+ * 曾经是一张 OR 关键词表，任一命中就兜底重写一次线上配置——`invalid csrf token`
+ *（实测会误触发）、`operation not allowed` 这类与白名单毫无关系的报错都会让 botmux
+ * 再写一次开放平台安全设置。判不出来就**不**兜底：少一次可能有用的重试，好过在
+ * 网络 / 鉴权 / 限流故障上多改一次线上配置。
+ */
+function isRedirectUrlRejectedError(err: unknown): boolean {
+  if (isLikelyTransientNetworkError(err)) return false;
+  if (err instanceof OpenPlatformApiError) {
+    if (err.status === 401 || err.status === 403) return false;
+    if (err.status === 408 || err.status === 409 || err.status === 429) return false;
+    if (err.status >= 500) return false;
+    if (openPlatformOwnerAccessDenied(err)) return false;
+  }
+  const message = safeErrorMessage(err);
+  return matchesRedirectUrlSubject(message) && matchesRedirectUrlRejection(message);
+}
+
+/**
+ * Build the incremental event-subscription payload used by the developer
+ * console (`updateEvent` in the console frontend bundle):
+ * `{clientId, operation:'add', events, appEvents, userEvents, eventMode}`。
+ * eventMode 必须回填读接口返回的当前值,事件按接收身份分桶(应用/用户)。
+ */
+export function buildEventSubscriptionPayload(
+  appId: string,
+  eventMode: number,
+  appEvents: string[],
+  userEvents: string[],
+  events: string[] = [],
+) {
+  return {
+    clientId: appId,
+    operation: 'add',
+    events,
+    appEvents,
+    userEvents,
+    eventMode,
+  };
+}
+
+/** 同款增量契约的回调版(console frontend `updateCallback`)。 */
+export function buildCallbackSubscriptionPayload(appId: string, callbackMode: number, callbacks: string[]) {
+  return {
+    clientId: appId,
+    operation: 'add',
+    callbacks,
+    callbackMode,
+  };
+}
+
+export interface OpenPlatformEventState {
+  eventMode?: number;
+  /** 所有已订阅事件(顶层 events + 应用/用户身份分组的并集)。 */
+  events: string[];
+  appEvents: string[];
+  userEvents: string[];
+}
+
+export interface OpenPlatformCallbackState {
+  callbackMode?: number;
+  callbacks: string[];
+}
+
+/** Extract the event mode and subscribed event ids from `/developers/v1/event/:clientId`. */
+export function extractOpenPlatformEventState(payload: unknown): OpenPlatformEventState {
+  const root = asRecord(payload);
+  const wrapped = asRecord(root.data);
+  const data = Object.keys(wrapped).length > 0 ? wrapped : root;
+  const appEvents = uniqueStrings([
+    ...extractEventIds(data.appEvents),
+    ...extractEventIdsFromDetails(data.appEventDetails),
+  ]);
+  const userEvents = uniqueStrings([
+    ...extractEventIds(data.userEvents),
+    ...extractEventIdsFromDetails(data.userEventDetails),
+  ]);
+  const genericEvents = uniqueStrings([
+    ...extractEventIds(data.events),
+    ...extractEventIdsFromDetails(data.eventDetails),
+  ]);
+  const eventMode = typeof data.eventMode === 'number' && Number.isFinite(data.eventMode)
+    ? data.eventMode
+    : undefined;
+  return {
+    eventMode,
+    events: uniqueStrings([...genericEvents, ...appEvents, ...userEvents]),
+    appEvents,
+    userEvents,
+  };
+}
+
+/** Extract the callback mode and subscribed callback ids from `/developers/v1/callback/:clientId`. */
+export function extractOpenPlatformCallbackState(payload: unknown): OpenPlatformCallbackState {
+  const root = asRecord(payload);
+  const wrapped = asRecord(root.data);
+  const data = Object.keys(wrapped).length > 0 ? wrapped : root;
+  const callbackMode = typeof data.callbackMode === 'number' && Number.isFinite(data.callbackMode)
+    ? data.callbackMode
+    : undefined;
+  return { callbackMode, callbacks: extractEventIds(data.callbacks) };
+}
+
+function extractEventIds(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return uniqueStrings(value
+    .map(item => typeof item === 'string' ? item : pickString(asRecord(item), ['id']))
+    .filter((item): item is string => Boolean(item)));
+}
+
+function extractEventIdsFromDetails(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return uniqueStrings(value.flatMap(group => extractEventIds(asRecord(group).items)));
+}
+
+/**
+ * 应用版本创建 payload,与 console launcher「一键创建智能体」同款极简结构
+ * (CDP 抓包确认)。⚠️不要重新加回 applyReasonConfig / isAutoAudit:false ——
+ * 那会让版本进入人工审核、发布后应用停在「未上架/未启用」(tenantAppStatus=0),
+ * 事件配置进了草稿也无法在企业内生效。visibleSuggest.members 必须含创建者,
+ * 否则同样不会自动上架启用。
+ *
+ * ⚠️ **visibleSuggest 是全量覆写语义**：这里给什么,新版本的可见范围就是什么,
+ * 没给的集合会被清空而不是保持原样。因此**只有全新应用的首次发布**能用这个
+ * 默认的空 departments/groups + isAll:0 —— 对已有应用发版,调用方必须先用
+ * {@link parseOnlineVisibility} 读回线上可见范围并整块覆盖 visibleSuggest /
+ * blackVisibleSuggest（见 automateOpenPlatformSetup 与 open-platform-rename）。
+ * 曾经漏掉这一步,导致每次权限自愈自动发版都把「全员可见 / 部门 / 用户组」
+ * 静默清空。
+ */
 export function buildAppVersionCreatePayload(appVersion: string, visibleMemberIds: string[] = []) {
   return {
     appVersion,
     mobileDefaultAbility: 'bot',
     pcDefaultAbility: 'bot',
-    changeLog: 'Init version',
+    changeLog: 'Initial bot release.',
     visibleSuggest: {
       departments: [],
       members: visibleMemberIds,
       groups: [],
       isAll: 0,
     },
-    applyReasonConfig: {
-      apiPrivilegeNeedReason: true,
-      contactPrivilegeNeedReason: true,
-      dataPrivilegeReasonMap: {},
-      visibleScopeNeedReason: true,
-      apiPrivilegeReasonMap: {},
-      contactPrivilegeReason: '',
-      isDataPrivilegeExpandMap: {},
-      visibleScopeReason: '',
-      dataPrivilegeNeedReason: true,
-      isAutoAudit: false,
-      isContactExpand: false,
-    },
-    b2cShareSuggest: false,
-    autoPublish: false,
-    remark: 'Personal AI assistant for self use',
     blackVisibleSuggest: {
       departments: [],
       members: [],
@@ -315,14 +875,25 @@ export async function prepareFeishuWebSession(
 ): Promise<FeishuWebSessionPrepareResult> {
   const fetcher = options.fetchImpl ?? fetch;
   const sessionFile = options.sessionFilePath ?? botmuxFeishuSessionFilePath();
-  const cached = readStoredCookiesFromSessionFile(sessionFile);
-  if (cached && cached.length > 0 && await validateFeishuWebSession(cached, fetcher)) {
+  if (!options.forceQrLogin) {
+    const cached = readStoredCookiesFromSessionFile(sessionFile);
+    if (cached && cached.length > 0 && await validateFeishuWebSession(cached, fetcher)) {
+      return {
+        ok: true,
+        sessionFile,
+        source: 'botmux_cache',
+        cookies: cached,
+        cookieCount: cached.length,
+      };
+    }
+  }
+
+  if (options.disableQrLogin) {
     return {
-      ok: true,
+      ok: false,
+      reason: 'invalid_session',
+      message: '没有可复用的 Feishu Web session；为避免意外出现第二个二维码，已停止自动登录',
       sessionFile,
-      source: 'botmux_cache',
-      cookies: cached,
-      cookieCount: cached.length,
     };
   }
 
@@ -342,7 +913,7 @@ export async function prepareFeishuWebSession(
   }
 
   const fallbackSessionFile = options.bytedcliFallbackSessionFilePath ?? bytedcliFeishuSessionFilePath();
-  if (!options.disableBytedcliFallback) {
+  if (!options.forceQrLogin && !options.disableBytedcliFallback) {
     const fallback = readStoredCookiesFromBytedcliSession(fallbackSessionFile);
     if (fallback && fallback.length > 0 && await validateFeishuWebSession(fallback, fetcher)) {
       writeStoredCookiesToSessionFile(sessionFile, fallback);
@@ -361,7 +932,7 @@ export async function prepareFeishuWebSession(
     reason: classifyFeishuLoginError(loginError),
     message: safeErrorMessage(loginError),
     sessionFile,
-    fallbackSessionFile: options.disableBytedcliFallback ? undefined : fallbackSessionFile,
+    fallbackSessionFile: options.disableBytedcliFallback || options.forceQrLogin ? undefined : fallbackSessionFile,
   };
 }
 
@@ -370,7 +941,12 @@ export async function automateOpenPlatformSetup(
 ): Promise<OpenPlatformAutomationResult> {
   const brand = options.brand ?? 'feishu';
   if (brand !== 'feishu') {
-    return { ok: false, reason: 'unsupported_brand', message: '开放平台自动配置当前只支持 feishu.cn 租户' };
+    return {
+      ok: false,
+      reason: 'unsupported_brand',
+      message: '开放平台自动配置当前只支持 feishu.cn 租户',
+      redirectConfigured: false,
+    };
   }
 
   const fetcher = options.fetchImpl ?? fetch;
@@ -378,10 +954,13 @@ export async function automateOpenPlatformSetup(
     sessionFilePath: options.sessionFilePath,
     bytedcliFallbackSessionFilePath: options.bytedcliFallbackSessionFilePath,
     disableBytedcliFallback: options.disableBytedcliFallback,
+    forceQrLogin: options.forceQrLogin,
+    disableQrLogin: options.disableQrLogin,
     fetchImpl: fetcher,
     pollIntervalMs: options.pollIntervalMs,
     maxWaitMs: options.maxWaitMs,
     onQrCode: options.onQrCode,
+    onQrScanConfirmed: options.onQrScanConfirmed,
     onStatus: options.onStatus,
   });
   if (!preparedSession.ok) {
@@ -390,6 +969,7 @@ export async function automateOpenPlatformSetup(
       reason: preparedSession.reason,
       message: `获取 Feishu Web session 失败: ${preparedSession.message}`,
       sessionFile: preparedSession.sessionFile,
+      redirectConfigured: false,
     };
   }
 
@@ -417,7 +997,13 @@ export async function automateOpenPlatformSetup(
       csrfToken = extractOpenPlatformCsrfToken(homePage.text);
     }
   } catch (err: any) {
-    return { ok: false, reason: 'network', message: `读取开放平台页面失败: ${safeErrorMessage(err)}`, sessionFile };
+    return {
+      ok: false,
+      reason: 'network',
+      message: `读取开放平台页面失败: ${safeErrorMessage(err)}`,
+      sessionFile,
+      redirectConfigured: false,
+    };
   }
   if (!csrfToken) {
     return {
@@ -426,6 +1012,7 @@ export async function automateOpenPlatformSetup(
       message:
         'Feishu session 可读取，但开放平台页面没有返回 window.csrfToken；可能需要在浏览器完成开放平台登录',
       sessionFile,
+      redirectConfigured: false,
     };
   }
 
@@ -449,19 +1036,62 @@ export async function automateOpenPlatformSetup(
       data = null;
     }
     if (!response.ok) {
-      throw new OpenPlatformApiError(`HTTP ${response.status} ${path}: ${summarizeOpenPlatformPayload(data)}`, data);
+      throw new OpenPlatformApiError(`HTTP ${response.status} ${path}: ${summarizeOpenPlatformPayload(data)}`, data, response.status);
     }
     if (data && typeof data === 'object' && typeof data.code === 'number' && data.code !== 0) {
-      throw new OpenPlatformApiError(`code=${data.code} msg=${data.msg ?? data.message ?? ''}`, data);
+      throw new OpenPlatformApiError(`code=${data.code} msg=${data.msg ?? data.message ?? ''}`, data, response.status);
     }
     return data;
   };
+
+  // redirect 白名单：csrf 一就位就立刻写,**不再留到流程末尾**。
+  // 后面的 scope 读取 / robot 与事件开关 / 核心事件回读 任意一步失败都会提前
+  // return,把白名单一起拖死;而白名单缺失是 authorize 的**硬失败**(20029,用户
+  // 连飞书授权页都进不去,群聊模式 p2pMode=group、会话群标签、`/login` 全部授权
+  // 不了)。这一步独立 try/catch:失败只记 redirectWarning,不 return、不阻断后续。
+  let redirectConfigured = false;
+  let redirectWarning: string | undefined;
+  try {
+    // wanted 显式算一次并原样传下去：`redirectConfigured` 要靠「wanted 是否全部落盘」
+    // 判定（见 {@link missingRedirectUrls}），拿不到这份 wanted 就只能退回按 status
+    // 猜——那正是 `updated_fallback` 被假报成成功的原因。
+    const wantedRedirectUrls = collectBotmuxRedirectUrls();
+    const written = await writeRedirectWhitelist(postJson, options.appId, wantedRedirectUrls, {
+      // 只有「本次刚建出来的 app」才允许在读失败时盲写覆盖；存量 app 读不到就零写入。
+      allowBlindWrite: options.appJustCreated === true,
+    });
+    if (written.status === 'skipped_unreadable') {
+      // 「读不到线上现值 → 一次写请求都没发」。与下面的「写了但没写全」是两回事：
+      // 这里连线上有什么都不知道，谈不上缺哪几条，措辞也要分开。
+      redirectWarning = written.warning;
+    } else {
+      const missing = missingRedirectUrls(wantedRedirectUrls, written.redirectUrls);
+      if (missing.length === 0) {
+        redirectConfigured = true;
+      } else {
+        // 写请求返回 200 ≠ 想要的地址都在线上。缺的那条正是本机这次要用的回调地址时，
+        // authorize 照样 20029，报「已配置」等于把问题藏到用户踩坑那一刻。
+        redirectWarning = written.status === 'updated_fallback'
+          ? `完整地址列表被开放平台拒绝，已退回「线上现值 + 本机回调」最小集写入；仍缺: ${missing.join('、')}`
+          : `写入已提交，但以下回调地址仍未生效: ${missing.join('、')}`;
+      }
+    }
+  } catch (err: any) {
+    redirectWarning = `写入 redirect 白名单失败: ${safeErrorMessage(err)}`;
+  }
 
   let allScopesPayload: unknown;
   try {
     allScopesPayload = await postJson(`/developers/v1/scope/all/${options.appId}`);
   } catch (err: any) {
-    return { ok: false, reason: 'api_error', message: `读取开放平台 scope 列表失败: ${safeErrorMessage(err)}`, sessionFile };
+    return {
+      ok: false,
+      reason: openPlatformOwnerAccessDenied(err) ? 'owner_session_mismatch' : 'api_error',
+      message: `读取开放平台 scope 列表失败: ${safeErrorMessage(err)}`,
+      sessionFile,
+      redirectConfigured,
+      redirectWarning,
+    };
   }
 
   const manifest = options.scopeManifest ?? readDefaultScopeManifest();
@@ -486,14 +1116,218 @@ export async function automateOpenPlatformSetup(
     }
   }
 
+  // Web 创建的是普通企业自建应用（不是 SDK PersonalAgent），需要显式开启
+  // 机器人能力并把事件接收方式切到长连接。对已启用的 SDK/已有应用重复调用
+  // 是幂等的；这里设为致命步骤，因为缺任一项 daemon 都无法正常收消息。
   try {
-    await postJson(`/developers/v1/safe_setting/update/${options.appId}`, buildSafeSettingPayload(options.appId));
-    const contactRange = await postJson(`/developers/v1/contact_range/${options.appId}`, {});
-    const visibleMemberIds = extractContactRangeMemberIds(contactRange);
+    await postJson(`/developers/v1/robot/switch/${options.appId}`, { clientId: options.appId, enable: true });
+    await postJson(`/developers/v1/event/switch/${options.appId}`, { clientId: options.appId, eventMode: 4 });
+  } catch (err: any) {
+    return {
+      ok: false,
+      reason: 'api_error',
+      message: `启用机器人或长连接事件能力失败: ${safeErrorMessage(err)}`,
+      sessionFile,
+      redirectConfigured,
+      redirectWarning,
+    };
+  }
+
+  // 事件与回调都走 console 前端同款「增量」契约:先读现状 → operation:add 只补
+  // 缺失 → 回读确认。旧实现的 eventNames/eventNameList 参数和
+  // /event_callback/update 端点在开放平台并不存在,请求全部失败还被吞成
+  // warning——新建应用因此落地就没有任何事件订阅。核心项(im.message.receive_v1
+  // 事件 + card.action.trigger 回调)回读仍缺失时直接判失败:缺了它们 daemon
+  // 收不到消息/卡片点击,静默降级只会产出一个「建好了却不回话」的坏 bot。
+  const eventWarnings: string[] = [];
+  const readEventState = async () =>
+    extractOpenPlatformEventState(await postJson(`/developers/v1/event/${options.appId}`, { needEventDetail: true }));
+  const addEvents = async (appEvents: string[], userEvents: string[], eventMode: number) => {
+    await postJson(
+      `/developers/v1/event/update/${options.appId}`,
+      buildEventSubscriptionPayload(options.appId, eventMode, appEvents, userEvents),
+    );
+  };
+
+  let eventState: OpenPlatformEventState | undefined;
+  try {
+    eventState = await readEventState();
+  } catch (err: any) {
+    eventWarnings.push(`读取当前事件订阅失败: ${safeErrorMessage(err)}`);
+  }
+  const hasEvent = (name: string) => Boolean(eventState?.events.includes(name));
+  const wantedAppEvents = [...BOT_BASELINE_APP_EVENTS, ...BOT_OPTIONAL_APP_EVENTS, ...VC_MEETING_APP_EVENTS];
+  const missingAppEvents = wantedAppEvents.filter(name => !hasEvent(name));
+  const missingUserEvents = VC_MEETING_USER_EVENTS.filter(name => !hasEvent(name));
+  if (missingAppEvents.length > 0 || missingUserEvents.length > 0) {
+    const eventMode = eventState?.eventMode ?? LONG_CONNECTION_EVENT_MODE;
+    try {
+      await addEvents(missingAppEvents, missingUserEvents, eventMode);
+    } catch {
+      // 部分租户个别事件依赖的权限不可授予会拒掉整批——逐个补,别让长尾事件拖垮核心事件
+      for (const name of missingAppEvents) {
+        try {
+          await addEvents([name], [], eventMode);
+        } catch (err: any) {
+          const optional = (BOT_OPTIONAL_APP_EVENTS as readonly string[]).includes(name) ? '（可选事件, 不影响核心功能）' : '';
+          eventWarnings.push(`订阅事件 ${name} 失败${optional}: ${safeErrorMessage(err)}`);
+        }
+      }
+      for (const name of missingUserEvents) {
+        try {
+          await addEvents([], [name], eventMode);
+        } catch (err: any) {
+          eventWarnings.push(`订阅事件 ${name} 失败: ${safeErrorMessage(err)}`);
+        }
+      }
+    }
+    try {
+      eventState = await readEventState();
+    } catch (err: any) {
+      eventWarnings.push(`回读事件订阅失败: ${safeErrorMessage(err)}`);
+    }
+  }
+  const missingBaselineEvents = BOT_BASELINE_APP_EVENTS.filter(name => !hasEvent(name));
+  if (missingBaselineEvents.length > 0) {
+    eventWarnings.push(`基础事件未确认订阅: ${missingBaselineEvents.join(', ')}`);
+  }
+  // VC 事件缺失不阻断普通建 bot,但要显式带回给 VC listener 保存门
+  // (vcListenerEventGateError)——只看总 count 无法区分「缺的是不是 VC」。
+  const missingVcEvents: string[] = VC_MEETING_BOT_EVENTS.filter(name => !hasEvent(name));
+  if (missingVcEvents.length > 0) {
+    eventWarnings.push(`VC 会议事件未确认订阅: ${missingVcEvents.join(', ')}`);
+  }
+
+  // 卡片回调(card.action.trigger)在开放平台是「回调」不是「事件」,配置走
+  // /developers/v1/callback/*;回调接收方式独立于事件,需要单独切到长连接。
+  const readCallbackState = async () =>
+    extractOpenPlatformCallbackState(await postJson(`/developers/v1/callback/${options.appId}`, {}));
+  let callbackState: OpenPlatformCallbackState | undefined;
+  try {
+    callbackState = await readCallbackState();
+  } catch (err: any) {
+    eventWarnings.push(`读取当前回调订阅失败: ${safeErrorMessage(err)}`);
+  }
+  if (callbackState && callbackState.callbackMode !== LONG_CONNECTION_EVENT_MODE) {
+    try {
+      await postJson(`/developers/v1/callback/switch/${options.appId}`, {
+        clientId: options.appId,
+        callbackMode: LONG_CONNECTION_EVENT_MODE,
+      });
+      callbackState = await readCallbackState();
+    } catch (err: any) {
+      eventWarnings.push(`切换回调长连接模式失败: ${safeErrorMessage(err)}`);
+    }
+  }
+  let missingCallbacks = BOT_BASELINE_CALLBACKS.filter(name => !callbackState?.callbacks.includes(name));
+  if (missingCallbacks.length > 0) {
+    try {
+      await postJson(
+        `/developers/v1/callback/update/${options.appId}`,
+        buildCallbackSubscriptionPayload(
+          options.appId,
+          callbackState?.callbackMode ?? LONG_CONNECTION_EVENT_MODE,
+          [...missingCallbacks],
+        ),
+      );
+    } catch (err: any) {
+      eventWarnings.push(`订阅卡片回调失败: ${safeErrorMessage(err)}`);
+    }
+    try {
+      callbackState = await readCallbackState();
+    } catch (err: any) {
+      eventWarnings.push(`回读回调订阅失败: ${safeErrorMessage(err)}`);
+    }
+    missingCallbacks = BOT_BASELINE_CALLBACKS.filter(name => !callbackState?.callbacks.includes(name));
+  }
+
+  const subscribedEventCount =
+    [...wantedAppEvents, ...VC_MEETING_USER_EVENTS].filter(name => hasEvent(name)).length
+    + BOT_BASELINE_CALLBACKS.filter(name => callbackState?.callbacks.includes(name)).length;
+  const eventWarning = eventWarnings.length > 0 ? eventWarnings.join('; ') : undefined;
+  const criticalIssues: string[] = [
+    ...(options.requireVerifiedEvents ? missingBaselineEvents : BOT_CRITICAL_APP_EVENTS.filter(name => !hasEvent(name))),
+    ...missingCallbacks,
+  ];
+  // 长连接模式必须以回读为准:switch 接口返回成功≠生效,mode 不是 4 时
+  // daemon 走长连接同样收不到事件/回调。eventModeReady 显式带回结果——
+  // dashboard listener 门要靠它识别「订阅名齐但接收方式不对」的黑洞。
+  const eventModeReady = eventState?.eventMode === LONG_CONNECTION_EVENT_MODE;
+  if (!eventModeReady) {
+    criticalIssues.push(`事件接收模式=${eventState?.eventMode ?? '未知'}(需长连接 ${LONG_CONNECTION_EVENT_MODE})`);
+  }
+  if (callbackState?.callbackMode !== LONG_CONNECTION_EVENT_MODE) {
+    criticalIssues.push(`回调接收模式=${callbackState?.callbackMode ?? '未知'}(需长连接 ${LONG_CONNECTION_EVENT_MODE})`);
+  }
+  if (criticalIssues.length > 0) {
+    return {
+      ok: false,
+      reason: options.requireVerifiedEvents ? 'event_verification_failed' : 'api_error',
+      message: `核心事件/回调订阅未生效(${criticalIssues.join('; ')}),机器人将收不到消息或卡片点击;请到开放平台「事件与回调」手动补齐后重试`,
+      sessionFile,
+      subscribedEventCount,
+      eventWarning,
+      missingVcEvents,
+      eventModeReady,
+      redirectConfigured,
+      redirectWarning,
+    };
+  }
+
+  try {
+    // 原样镜像**线上版本**的可见范围（白/黑名单都带）——绝不注入「当前 Web
+    // session 操作者」:automateOpenPlatformSetup 也被 VC listener 保存 / 权限自愈 /
+    // 选择已有应用等路径调用,那里操作者不一定是创建者/现有可见成员,注入会悄悄
+    // 扩大已有 bot 的可见范围。新建应用的「上架启用」由 createOpenPlatformAppWithClient
+    // 的首次发布(含创建者可见)完成,与本处无关。
+    //
+    // ⚠️ 数据来源必须是 visible/online（应用可见范围），不是 contact_range
+    // （通讯录权限范围，是另一个概念）。历史上这里读的是 contact_range 且只取
+    // members、把 departments/groups/isAll 写死空值,于是每次自动发版都把「全员
+    // 可见 / 按部门授权 / 按用户组授权」静默清成「仅少数个人可见」——权限自愈
+    // 一重启就发版,受影响的人第二天集体访问不了应用。
+    //
+    // 解析失败 fail closed：此时还没建版,可见范围零改动,调用方降级为给管理员
+    // 发 DM 手动处理,绝不发布一个可能把人关在门外的版本。
+    let visibility: { visibleSuggest: VisibilitySuggest; blackVisibleSuggest: VisibilitySuggest };
+    try {
+      visibility = parseOnlineVisibility(await postJson(`/developers/v1/visible/online/${options.appId}`, {}));
+    } catch (err: any) {
+      if (!(err instanceof VisibilityParseError)) throw err;
+      return {
+        ok: false,
+        reason: 'visibility_unreadable',
+        message: `无法可靠读取应用现有可见范围（${err.message}），已中止发版以免重置可见范围；请到开放平台手动发布新版本`,
+        sessionFile,
+        subscribedEventCount,
+        eventWarning,
+        missingVcEvents,
+        eventModeReady,
+        redirectConfigured,
+        redirectWarning,
+      };
+    }
     const versionList = await postJson(`/developers/v1/app_version/list/${options.appId}`, {});
     const appVersion = nextAppVersion(versionList);
-    const created = await postJson(`/developers/v1/app_version/create/${options.appId}`, buildAppVersionCreatePayload(appVersion, visibleMemberIds));
+    const versionPayload = buildAppVersionCreatePayload(appVersion) as unknown as Record<string, unknown>;
+    versionPayload.visibleSuggest = visibility.visibleSuggest;
+    versionPayload.blackVisibleSuggest = visibility.blackVisibleSuggest;
+    const created = await postJson(`/developers/v1/app_version/create/${options.appId}`, versionPayload);
     const versionId = extractVersionId(created);
+    if (options.requireVerifiedEvents && !versionId) {
+      return {
+        ok: false,
+        reason: 'version_verification_failed',
+        message: '开放平台未返回可发布的精确版本 ID，受管机器人保持未激活',
+        sessionFile,
+        subscribedEventCount,
+        eventWarning,
+        missingVcEvents,
+        eventModeReady,
+        redirectConfigured,
+        redirectWarning,
+      };
+    }
     if (versionId) {
       await postJson(`/developers/v1/publish/commit/${options.appId}/${versionId}`, { clientId: options.appId });
     }
@@ -505,11 +1339,569 @@ export async function automateOpenPlatformSetup(
       scopeCount: importedScopeCount,
       skippedScopeCount,
       scopeWarning,
+      subscribedEventCount,
+      eventWarning,
+      missingVcEvents,
+      eventModeReady,
+      redirectConfigured,
+      redirectWarning,
+      ...(options.requireVerifiedEvents
+        ? {
+            eventMode: eventState?.eventMode,
+            verifiedEventCount: BOT_BASELINE_APP_EVENTS.length + BOT_BASELINE_CALLBACKS.length,
+          }
+        : {}),
       versionId,
     };
   } catch (err: any) {
-    return { ok: false, reason: 'api_error', message: `开放平台自动配置失败: ${safeErrorMessage(err)}`, sessionFile };
+    return {
+      ok: false,
+      reason: 'api_error',
+      message: `开放平台自动配置失败: ${safeErrorMessage(err)}`,
+      sessionFile,
+      subscribedEventCount,
+      eventWarning,
+      missingVcEvents,
+      eventModeReady,
+      redirectConfigured,
+      redirectWarning,
+    };
   }
+}
+
+/**
+ * dashboard 保存 VC 会议监听 bot 前的事件订阅门。普通建 bot 允许 VC 事件缺失
+ * (只记 warning),但 listener 缺 VC 事件=会议邀请黑洞,必须阻断保存。
+ * 只看 subscribedEventCount 总数无法区分「缺的是不是 VC」,所以要看
+ * missingVcEvents。返回错误描述;可保存时返回 null。
+ */
+export function vcListenerEventGateError(result: {
+  eventWarning?: string;
+  subscribedEventCount?: number;
+  missingVcEvents?: string[];
+  eventModeReady?: boolean;
+}): string | null {
+  if (result.eventWarning && (result.subscribedEventCount ?? 0) === 0) {
+    return `事件订阅全部失败(${result.eventWarning})`;
+  }
+  // 订阅名齐但接收方式不是长连接同样收不到——eventModeReady 显式 false 才阻断,
+  // undefined(走到订阅阶段前就失败)保持原 best-effort 语义。
+  if (result.eventModeReady === false) {
+    return `事件接收方式未确认为长连接${result.eventWarning ? `(${result.eventWarning})` : ''}`;
+  }
+  const missingVc = result.missingVcEvents ?? [];
+  if (missingVc.length > 0) {
+    return `VC 会议事件未订阅成功(${missingVc.join(', ')})${result.eventWarning ? `;${result.eventWarning}` : ''}`;
+  }
+  return null;
+}
+
+// ─── 已有应用列表 / 凭证读取（setup「选择已有应用」路径）───────────────────────
+//
+// 复用同一套 Web session + console CSRF 机制，调 console 前端同款接口
+// （bundle 里的 getAppList / getAppSecret）。与 automateOpenPlatformSetup 的
+// 内联 postJson 少量重复——那条链路已实测稳定且 CSRF 种子页 / referer 都绑定
+// 具体 appId，不强行合并，避免动到已验证的自动配置路径。
+
+export interface OpenPlatformAppSummary {
+  clientId: string;
+  name: string;
+  /** 应用描述（接口给什么用什么，仅展示）。 */
+  description?: string;
+}
+
+export interface OpenPlatformApiClient {
+  apiOrigin: string;
+  postJson(path: string, body?: unknown): Promise<unknown>;
+  postForm(path: string, body: FormData): Promise<unknown>;
+}
+
+export type OpenPlatformClientResult =
+  | { ok: true; client: OpenPlatformApiClient; identity?: FeishuWebSessionIdentity }
+  | { ok: false; reason: 'missing_csrf' | 'network'; message: string };
+
+/**
+ * 用已就绪的 Web session cookies 构造开放平台 console API 客户端：加载 console
+ * 页面提取 `window.csrfToken` 与最终 origin（部分租户会把控制台重定向到
+ * open.larkoffice.com），返回可调 `/developers/v1/*` 的 postJson。
+ */
+export async function createOpenPlatformApiClient(
+  cookies: StoredCookie[],
+  opts: { fetchImpl?: typeof fetch } = {},
+): Promise<OpenPlatformClientResult> {
+  const fetcher = opts.fetchImpl ?? fetch;
+  const session = new MutableCookieJar(cookies);
+  let csrfToken: string | null = null;
+  let apiOrigin = 'https://open.feishu.cn';
+  let referer = `${apiOrigin}/app`;
+  let identity: FeishuWebSessionIdentity | undefined;
+  try {
+    const page = await session.fetchTextWithUrl(fetcher, `${apiOrigin}/app`);
+    apiOrigin = new URL(page.finalUrl).origin;
+    referer = page.finalUrl;
+    csrfToken = extractOpenPlatformCsrfToken(page.text);
+    identity = extractOpenPlatformSessionIdentity(page.text) ?? undefined;
+  } catch (err) {
+    return { ok: false, reason: 'network', message: `读取开放平台页面失败: ${safeErrorMessage(err)}` };
+  }
+  if (!csrfToken) {
+    return {
+      ok: false,
+      reason: 'missing_csrf',
+      message: '开放平台页面没有返回 window.csrfToken；Web session 可能已过期或未完成开放平台登录',
+    };
+  }
+
+  const request = async (path: string, body?: BodyInit, contentType?: string): Promise<unknown> => {
+    const url = `${apiOrigin}${path}`;
+    const response = await session.fetchRaw(fetcher, url, {
+      method: 'POST',
+      headers: {
+        accept: 'application/json, text/plain, */*',
+        origin: apiOrigin,
+        referer,
+        'x-csrf-token': csrfToken!,
+        ...(contentType ? { 'content-type': contentType } : {}),
+      },
+      body,
+    });
+    let data: any;
+    try {
+      data = await response.json();
+    } catch {
+      data = null;
+    }
+    if (!response.ok) {
+      throw new OpenPlatformApiError(`HTTP ${response.status} ${path}: ${summarizeOpenPlatformPayload(data)}`, data, response.status);
+    }
+    if (data && typeof data === 'object' && typeof data.code === 'number' && data.code !== 0) {
+      throw new OpenPlatformApiError(`code=${data.code} msg=${data.msg ?? data.message ?? ''}`, data, response.status);
+    }
+    return data;
+  };
+
+  const postJson = async (path: string, body?: unknown): Promise<unknown> =>
+    request(path, body === undefined ? undefined : JSON.stringify(body), body === undefined ? undefined : 'application/json');
+  const postForm = async (path: string, body: FormData): Promise<unknown> => request(path, body);
+
+  return { ok: true, client: { apiOrigin, postJson, postForm }, identity };
+}
+
+/**
+ * 只检查现有缓存，不展示二维码。Dashboard 打开添加表单时调用；返回的账号/企业
+ * 会显示给用户，并在真正创建前再次比对，避免旧 cookie 把应用建到错误租户。
+ */
+export async function inspectCachedFeishuOpenPlatformSession(
+  options: Pick<FeishuWebSessionOptions, 'sessionFilePath' | 'fetchImpl'> = {},
+): Promise<FeishuOpenPlatformSessionInspectionResult> {
+  const prepared = await prepareFeishuWebSession({
+    ...options,
+    disableQrLogin: true,
+    disableBytedcliFallback: true,
+  });
+  if (!prepared.ok) return prepared;
+  const clientResult = await createOpenPlatformApiClient(prepared.cookies, { fetchImpl: options.fetchImpl });
+  if (!clientResult.ok) {
+    return {
+      ok: false,
+      reason: clientResult.reason,
+      message: clientResult.message,
+      sessionFile: prepared.sessionFile,
+    };
+  }
+  if (!clientResult.identity) {
+    return {
+      ok: false,
+      reason: 'identity_unavailable',
+      message: '开放平台没有返回当前账号与企业信息；为避免创建到错误租户，未复用该登录态',
+      sessionFile: prepared.sessionFile,
+    };
+  }
+  return {
+    ok: true,
+    source: prepared.source,
+    identity: clientResult.identity,
+    sessionFile: prepared.sessionFile,
+  };
+}
+
+export type CreateFeishuOpenPlatformAppResult =
+  | {
+      ok: true;
+      appId: string;
+      appSecret: string;
+      brand: 'feishu';
+      sessionFile: string;
+      sessionSource: FeishuWebSessionSource;
+      sessionIdentity: FeishuWebSessionIdentity;
+    }
+  | {
+      ok: false;
+      reason:
+        | FeishuWebSessionFailureReason
+        | 'missing_csrf'
+        | 'missing_icon'
+        | 'identity_unavailable'
+        | 'session_changed'
+        | 'api_error';
+      message: string;
+      /** 应用已经建成但读取 Secret 失败时返回，调用方不得再创建一个重复应用。 */
+      appId?: string;
+      sessionFile?: string;
+    };
+
+export interface CreateFeishuOpenPlatformAppOptions extends FeishuWebSessionOptions {
+  name: string;
+  description?: string;
+  /** 测试/定制图标；默认复用 botmux dashboard 的 512x512 favicon。 */
+  iconFilePath?: string;
+  /** Dashboard 表单打开时显示过的缓存身份；创建前必须仍是同一人、同一企业。 */
+  expectedIdentity?: Pick<FeishuWebSessionIdentity, 'userId' | 'tenantId'>;
+  /** 已拿到并验证账号/企业、但尚未创建应用时触发。 */
+  onSessionReady?: (info: {
+    source: FeishuWebSessionSource;
+    identity: FeishuWebSessionIdentity;
+  }) => void | Promise<void>;
+}
+
+class CreatedOpenPlatformAppError extends Error {
+  constructor(readonly appId: string, cause: unknown) {
+    super(`应用 ${appId} 已创建，但启用机器人能力或读取 AppSecret 失败: ${safeErrorMessage(cause)}`);
+  }
+}
+
+function defaultBotmuxAppIconPath(): string | undefined {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    // npm build: dist/setup/open-platform-automation.js -> dist/dashboard-web/favicon.png
+    join(here, '..', 'dashboard-web', 'favicon.png'),
+    // tsx / vitest: src/setup/open-platform-automation.ts -> src/dashboard/web/favicon.png
+    join(here, '..', 'dashboard', 'web', 'favicon.png'),
+  ];
+  return candidates.find(existsSync);
+}
+
+function pickPayloadString(payload: unknown, keys: string[]): string | undefined {
+  const record = asRecord(payload);
+  return pickString(record, keys) ?? pickString(asRecord(record.data), keys);
+}
+
+/** 「一键创建智能体」(backend_oneclick launcher) 使用的应用清单模板 ID。 */
+export const ONECLICK_APP_MANIFEST_TEMPLATE_ID = 'developer_console';
+
+/**
+ * Build the payload for `POST /developers/v1/manifest/upsert_by_template` —
+ * the console launcher's one-click agent creation endpoint (CDP 抓包确认)。
+ * 该模板建出的应用开箱自带 bot 能力、长连接事件/回调模式、基础事件订阅与
+ * card.action.trigger 回调,正是「正常申请默认带的权限」。
+ */
+export function buildManifestTemplateCreatePayload(
+  name: string,
+  description: string,
+  avatar: string,
+  cid: string,
+) {
+  return {
+    appManifestTemplateID: ONECLICK_APP_MANIFEST_TEMPLATE_ID,
+    createAppUserCustomField: {
+      i18n: { zh_cn: { name, description } },
+      avatar,
+      primaryLang: 'zh_cn',
+    },
+    cid,
+    HTTPHead: {},
+  };
+}
+
+/**
+ * 模板创建是否属于服务端「明确拒绝」——即可确定应用没有建出来,允许安全
+ * 回退 app/create。业务错误码(code!==0,服务端解析请求后拒绝)与 HTTP 404
+ * (端点不存在)算明确拒绝;传输错误(ECONNRESET/timeout,非
+ * OpenPlatformApiError)、HTTP 5xx、code=0 缺 ClientID 都属「结果未知」——
+ * 服务端可能已 commit,跨端点重建会产生孤儿 + 重复应用,必须 fail-closed。
+ */
+function isDefiniteTemplateRejection(err: unknown): boolean {
+  if (!(err instanceof OpenPlatformApiError)) return false;
+  const code = (asRecord(err.payload) as { code?: unknown }).code;
+  if (typeof code === 'number' && code !== 0) return true;
+  return /^HTTP 404\b/.test(err.message);
+}
+
+/**
+ * 用已经登录的开放平台 Web session 创建一个企业自建应用并读取凭证。
+ *
+ * 首选 console launcher 的「一键创建智能体」模板接口
+ * (manifest/upsert_by_template):模板应用出生即带 bot 能力、长连接、基础
+ * 事件与卡片回调,新建 bot 不再依赖后续订阅补齐。模板 ID 属内部契约,被
+ * 服务端明确拒绝时自动回退旧 app/create(裸自建应用,事件/回调由
+ * automateOpenPlatformSetup 增量补齐并 fail-closed 兜底);创建结果未知时
+ * 不回退(见 isDefiniteTemplateRejection)。Secret 只存在返回值中,不打印、
+ * 不写日志。
+ */
+export async function createOpenPlatformAppWithClient(
+  client: OpenPlatformApiClient,
+  // creatorUserId 必填:首次「启用发布」的版本可见范围必须含创建者,否则发布后
+  // 应用不会自动上架启用。调用方(createFeishuOpenPlatformApp)已保证 session
+  // identity 可用才会走到这里。
+  options: { name: string; description?: string; iconFilePath?: string; creatorUserId: string },
+): Promise<{ appId: string; appSecret: string }> {
+  const name = options.name.trim();
+  if (!name) throw new Error('应用名称不能为空');
+  if (!options.creatorUserId) throw new Error('创建应用缺少创建者 userId,无法完成上架启用');
+  const iconFile = options.iconFilePath ?? defaultBotmuxAppIconPath();
+  if (!iconFile || !existsSync(iconFile)) throw new Error('找不到 botmux 默认应用图标');
+
+  const icon = readFileSync(iconFile);
+  const form = new FormData();
+  form.append('file', new Blob([icon], { type: 'image/png' }), 'botmux.png');
+  form.append('uploadType', '4'); // Open Platform console enum: Icon
+  form.append('isIsv', 'false'); // 企业自建应用
+  form.append('scale', JSON.stringify({ width: 512, height: 512 }));
+  const uploaded = await client.postForm('/developers/v1/app/upload/image', form);
+  const avatar = pickPayloadString(uploaded, ['url']);
+  if (!avatar) throw new Error('开放平台上传图标后没有返回 url');
+
+  const description = options.description?.trim() || 'AI coding assistant powered by botmux';
+  let appId: string | undefined;
+  try {
+    const created = await client.postJson(
+      '/developers/v1/manifest/upsert_by_template',
+      buildManifestTemplateCreatePayload(name, description, avatar, randomUUID()),
+    );
+    const templateAppId = pickPayloadString(created, ['ClientID', 'clientID', 'clientId', 'appId']);
+    if (!templateAppId?.startsWith('cli_')) {
+      // code=0 却没有 ClientID:应用可能已建成(响应结构变化),结果未知——
+      // 不能落入 fallback 再 create,让下面的 catch 按「非明确拒绝」抛出。
+      throw new Error('一键智能体模板创建返回成功但没有 ClientID(结果未知);请到开放平台确认是否已创建同名应用后重试');
+    }
+    appId = templateAppId;
+  } catch (err) {
+    if (!isDefiniteTemplateRejection(err)) throw err;
+    console.warn(`一键智能体模板创建被拒,回退普通自建应用: ${safeErrorMessage(err)}`);
+    appId = undefined;
+  }
+  if (!appId) {
+    const created = await client.postJson('/developers/v1/app/create', {
+      appSceneType: 0, // SelfBuild
+      name,
+      desc: description,
+      avatar,
+      i18n: { zh_cn: { name, description } },
+      primaryLang: 'zh_cn',
+    });
+    appId = pickPayloadString(created, ['ClientID', 'clientID', 'clientId', 'appId']);
+  }
+  if (!appId?.startsWith('cli_')) throw new Error('开放平台创建应用后没有返回 ClientID');
+
+  try {
+    // 模板应用出生已带 bot + 长连接(重复调用幂等);fallback 的裸自建应用
+    // 则必须显式开启——这两步是「一扫即用」的必要条件,在返回凭证前完成。
+    // robot/event switch 都是幂等设值,故对宿主机↔飞书的瞬态网络抖动小步重试:
+    // 一次 undici `fetch failed` 不该让「应用已建成但没启用能力」半途而废
+    // (那会把用户丢进手动读 Secret + CLI 续跑的恢复路径)。
+    await retryIdempotentOnTransientNetworkError(() =>
+      client.postJson(`/developers/v1/robot/switch/${appId}`, { clientId: appId, enable: true }));
+    await retryIdempotentOnTransientNetworkError(() =>
+      client.postJson(`/developers/v1/event/switch/${appId}`, { clientId: appId, eventMode: 4 })); // WebSocket
+
+    // 复刻 console launcher「一键创建智能体」的最后一步:立刻用极简版本发布一次,
+    // 让应用**上架启用**(tenantAppStatus 0→2)。这样返回的就是一个「已启用、可
+    // 收发消息」的应用——等价于旧 SDK registerApp 直接产出可用 PersonalAgent 的效果。
+    // 这一步 fail-closed:拿到 versionId 后 commit 失败、或 code=0 却没 versionId
+    // (可能留下未发布草稿),都视为创建失败抛出(带 appId,由调用方兜底/提示),
+    // 不宣称「后续 setup 会软兜底」——setup 的 nextAppVersion 不复用未发布草稿,
+    // 版本号可能撞车导致二次发版继续失败,应用永远停在未启用。
+    // ⚠️ version/create、publish/commit 是非幂等写操作(传输失败即结果未知,
+    // 重放会重复建版/撞版本号),故绝不套 retryIdempotent… 包装,与 fetchRaw
+    // 只对 GET/HEAD 重试同源。
+    const versionCreated = await client.postJson(
+      `/developers/v1/app_version/create/${appId}`,
+      buildAppVersionCreatePayload('1.0.0', [options.creatorUserId]),
+    );
+    const enableVersionId = extractVersionId(versionCreated);
+    if (!enableVersionId) {
+      throw new Error('上架启用版本创建返回成功但没有 versionId(可能已留下未发布草稿);请到开放平台确认后重试');
+    }
+    await client.postJson(`/developers/v1/publish/commit/${appId}/${enableVersionId}`, { clientId: appId });
+
+    // 读 Secret 是纯只读 POST(getAppSecret 同款,不触碰 reset),幂等可重试:
+    // 应用已建成、已发布,唯独最后一步读 Secret 撞网络抖动而失败最可惜——
+    // 重试让它自愈,而不是把整条链路判死。
+    const appSecret = await retryIdempotentOnTransientNetworkError(() =>
+      fetchOpenPlatformAppSecret(client, appId!));
+    return { appId, appSecret };
+  } catch (err) {
+    throw new CreatedOpenPlatformAppError(appId, err);
+  }
+}
+
+/**
+ * Read-only probe: are this app's VC meeting events (vc.bot.meeting_* +
+ * participant_meeting_joined) subscribed, and is event mode the long connection?
+ * Uses ONLY the cached Feishu Web session (disableQrLogin) and never publishes a
+ * version — so it is safe to call at daemon startup. The caller decides whether
+ * to run the full (publishing) automateOpenPlatformSetup based on the result:
+ * only when events are actually missing / mode is wrong.
+ */
+export type VcMeetingEventProbeResult =
+  | { ok: true; missingVcEvents: string[]; eventModeReady: boolean; sessionFile?: string }
+  | { ok: false; reason: string; message: string; sessionFile?: string };
+
+export async function probeVcMeetingEventSubscription(
+  appId: string,
+  options: Pick<FeishuWebSessionOptions, 'sessionFilePath' | 'fetchImpl'> = {},
+): Promise<VcMeetingEventProbeResult> {
+  const prepared = await prepareFeishuWebSession({
+    ...options,
+    disableQrLogin: true,
+    disableBytedcliFallback: true,
+  });
+  if (!prepared.ok) {
+    return { ok: false, reason: prepared.reason, message: prepared.message, sessionFile: prepared.sessionFile };
+  }
+  const clientResult = await createOpenPlatformApiClient(prepared.cookies, { fetchImpl: options.fetchImpl });
+  if (!clientResult.ok) {
+    return { ok: false, reason: clientResult.reason, message: clientResult.message, sessionFile: prepared.sessionFile };
+  }
+  try {
+    const eventState = extractOpenPlatformEventState(
+      await clientResult.client.postJson(`/developers/v1/event/${appId}`, { needEventDetail: true }),
+    );
+    const has = (name: string) => eventState.events.includes(name);
+    return {
+      ok: true,
+      missingVcEvents: VC_MEETING_BOT_EVENTS.filter(name => !has(name)),
+      eventModeReady: eventState.eventMode === LONG_CONNECTION_EVENT_MODE,
+      sessionFile: prepared.sessionFile,
+    };
+  } catch (err: any) {
+    return { ok: false, reason: 'api_error', message: `读取事件订阅失败: ${safeErrorMessage(err)}`, sessionFile: prepared.sessionFile };
+  }
+}
+
+/**
+ * 单次飞书 Web 扫码完成应用创建。session 会写入 ~/.botmux，后续
+ * automateOpenPlatformSetup 会直接复用，因此权限/redirect/发版不再二次扫码。
+ */
+export async function createFeishuOpenPlatformApp(
+  options: CreateFeishuOpenPlatformAppOptions,
+): Promise<CreateFeishuOpenPlatformAppResult> {
+  const prepared = await prepareFeishuWebSession(options);
+  if (!prepared.ok) {
+    return {
+      ok: false,
+      reason: prepared.reason,
+      message: `获取 Feishu Web session 失败: ${prepared.message}`,
+      sessionFile: prepared.sessionFile,
+    };
+  }
+
+  const clientResult = await createOpenPlatformApiClient(prepared.cookies, { fetchImpl: options.fetchImpl });
+  if (!clientResult.ok) {
+    return {
+      ok: false,
+      reason: clientResult.reason,
+      message: clientResult.message,
+      sessionFile: prepared.sessionFile,
+    };
+  }
+  if (!clientResult.identity) {
+    return {
+      ok: false,
+      reason: 'identity_unavailable',
+      message: '开放平台没有返回当前账号与企业信息；为避免创建到错误租户，未创建应用',
+      sessionFile: prepared.sessionFile,
+    };
+  }
+  if (options.expectedIdentity
+    && (clientResult.identity.userId !== options.expectedIdentity.userId
+      || clientResult.identity.tenantId !== options.expectedIdentity.tenantId)) {
+    return {
+      ok: false,
+      reason: 'session_changed',
+      message: `当前登录账号或企业已变化（${clientResult.identity.userName} · ${clientResult.identity.tenantName}）；请重新确认后再创建`,
+      sessionFile: prepared.sessionFile,
+    };
+  }
+
+  try {
+    await options.onSessionReady?.({ source: prepared.source, identity: clientResult.identity });
+    const credentials = await createOpenPlatformAppWithClient(clientResult.client, {
+      ...options,
+      creatorUserId: clientResult.identity.userId,
+    });
+    return {
+      ok: true,
+      ...credentials,
+      brand: 'feishu',
+      sessionFile: prepared.sessionFile,
+      sessionSource: prepared.source,
+      sessionIdentity: clientResult.identity,
+    };
+  } catch (err) {
+    const message = safeErrorMessage(err);
+    return {
+      ok: false,
+      reason: /默认应用图标/.test(message) ? 'missing_icon' : 'api_error',
+      message,
+      ...(err instanceof CreatedOpenPlatformAppError ? { appId: err.appId } : {}),
+      sessionFile: prepared.sessionFile,
+    };
+  }
+}
+
+/**
+ * 列出当前登录人可见的自建应用（console `getAppList` 同款：
+ * POST /developers/v1/app/list，body {Count, Cursor, QueryFilter}，响应
+ * data.apps + totalCount，分页拉全）。console 是内部接口，item 字段名做
+ * 宽松解析，取不到 cli_ 开头 clientId 的条目丢弃。失败抛错（含 API 错误）。
+ */
+export async function listOpenPlatformApps(
+  client: OpenPlatformApiClient,
+  opts: { pageSize?: number; maxApps?: number } = {},
+): Promise<OpenPlatformAppSummary[]> {
+  const pageSize = opts.pageSize ?? 100;
+  const maxApps = opts.maxApps ?? 500;
+  const out: OpenPlatformAppSummary[] = [];
+  for (let cursor = 0; cursor < maxApps; cursor += pageSize) {
+    const payload = await client.postJson('/developers/v1/app/list', {
+      Count: pageSize,
+      Cursor: cursor,
+      QueryFilter: {},
+    });
+    const record = asRecord(payload);
+    const data = asRecord(record.data);
+    const apps = Array.isArray(data.apps) ? data.apps : Array.isArray(record.apps) ? (record.apps as unknown[]) : [];
+    for (const item of apps) {
+      const rec = asRecord(item);
+      const clientId = pickString(rec, ['clientId', 'client_id', 'appId', 'app_id', 'appID']);
+      if (!clientId || !clientId.startsWith('cli_')) continue;
+      const name = pickString(rec, ['name', 'appName', 'app_name']) ?? clientId;
+      const description = pickString(rec, ['description', 'desc', 'appDesc', 'app_desc']);
+      out.push({ clientId, name, ...(description ? { description } : {}) });
+    }
+    const totalCount = typeof data.totalCount === 'number' ? data.totalCount
+      : typeof record.totalCount === 'number' ? (record.totalCount as number) : undefined;
+    if (apps.length < pageSize) break;
+    if (totalCount !== undefined && cursor + pageSize >= totalCount) break;
+  }
+  return out;
+}
+
+/**
+ * 读取指定应用的 App Secret（console `getAppSecret` 同款：
+ * POST /developers/v1/secret/:clientId，响应含 secret 字段）。
+ * 只读接口——绝不触碰 /v1/secret/reset/*（会轮换 secret、打断在跑的 bot）。
+ */
+export async function fetchOpenPlatformAppSecret(
+  client: OpenPlatformApiClient,
+  clientId: string,
+): Promise<string> {
+  const payload = await client.postJson(`/developers/v1/secret/${clientId}`, {});
+  const record = asRecord(payload);
+  const secret = pickString(asRecord(record.data), ['secret']) ?? pickString(record, ['secret']);
+  if (!secret) throw new Error('开放平台没有返回 secret 字段');
+  return secret;
 }
 
 async function validateFeishuWebSession(cookies: StoredCookie[], fetcher: typeof fetch): Promise<boolean> {
@@ -541,12 +1933,17 @@ async function loginFeishuWebSession(fetcher: typeof fetch, options: FeishuWebSe
   const maxWaitMs = options.maxWaitMs ?? 120_000;
   const start = Date.now();
   let lastStatusMessage = '';
+  let scanConfirmationEmitted = false;
   for (;;) {
     if (Date.now() - start > maxWaitMs) {
       throw new FeishuWebSessionError('等待飞书扫码超时', 'timeout');
     }
 
     const poll = await pollFeishuQrLogin(session, fetcher, qrInit.flowKey);
+    if (poll.status === 2 && !scanConfirmationEmitted) {
+      scanConfirmationEmitted = true;
+      await options.onQrScanConfirmed?.({ confirmedAt: Date.now() });
+    }
     if (poll.nextStep === 'enter_app') {
       if (poll.crossLoginUri) {
         await session.fetchRaw(fetcher, poll.crossLoginUri, { method: 'GET' });
@@ -644,6 +2041,63 @@ function readDefaultScopeManifest(): ScopeManifest {
   throw new Error('找不到 botmux lark-scopes.json');
 }
 
+// 宿主机到飞书的偶发网络抖动（DNS EAI_AGAIN、连接被重置、路由瞬断等）会让
+// undici 把整个请求直接抛成 TypeError('fetch failed')，一次失败就中断 console
+// 自动化链路（dashboard 改名/改头像、VC 事件订阅检查都实测偶发中招）。这类
+// 错误按错误码识别，只对幂等请求小步退避重试。
+const TRANSIENT_NETWORK_ERROR_CODES = new Set([
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'ETIMEDOUT',
+  'EAI_AGAIN',
+  'ENOTFOUND',
+  'EPIPE',
+  'ENETUNREACH',
+  'EHOSTUNREACH',
+  'ENETDOWN',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_SOCKET',
+]);
+
+const TRANSIENT_FETCH_RETRY_DELAYS_MS = [300, 900];
+
+function isLikelyTransientNetworkError(err: unknown, depth = 0): boolean {
+  if (depth > 4 || !(err instanceof Error)) return false;
+  // 调用方主动 abort / 超时不算网络抖动，重试会违背调用方意图。
+  if (err.name === 'AbortError' || err.name === 'TimeoutError') return false;
+  const code = (err as { code?: unknown }).code;
+  if (typeof code === 'string' && TRANSIENT_NETWORK_ERROR_CODES.has(code)) return true;
+  if (err instanceof AggregateError && err.errors.some(item => isLikelyTransientNetworkError(item, depth + 1))) {
+    return true;
+  }
+  // undici 网络层失败统一表现为 TypeError('fetch failed', { cause })；cause 缺失
+  // （老版本/被吞）时按瞬态处理——多试两次的代价远小于误报一次给用户。
+  if (err instanceof TypeError && err.message === 'fetch failed') {
+    return err.cause === undefined || isLikelyTransientNetworkError(err.cause, depth + 1);
+  }
+  return isLikelyTransientNetworkError((err as { cause?: unknown }).cause, depth + 1);
+}
+
+// 对「幂等」console 请求复用 fetchRaw 的瞬态退避:传输层抖动(fetch failed /
+// ECONNRESET 等)时小步重试,一次网络毛刺不再中断整条链路。API 层拒绝
+// (OpenPlatformApiError、HTTP 非 2xx、code!=0)无 code / cause,isLikely… 判 false,
+// 只会立刻抛出而不会被重放。
+// ⚠️ 只能包装「重复调用无副作用」的请求。app_version/create、publish/commit 这类
+// 「传输失败即结果未知、重放会重复提交/撞版本号」的非幂等写操作绝不能用本包装
+// (与 fetchRaw 只对 GET/HEAD 重试同源:见其上方注释)。
+async function retryIdempotentOnTransientNetworkError<T>(fn: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (attempt >= TRANSIENT_FETCH_RETRY_DELAYS_MS.length || !isLikelyTransientNetworkError(err)) {
+        throw err;
+      }
+      await sleep(TRANSIENT_FETCH_RETRY_DELAYS_MS[attempt]);
+    }
+  }
+}
+
 class MutableCookieJar {
   private cookies: StoredCookie[];
 
@@ -672,6 +2126,10 @@ class MutableCookieJar {
   async fetchRaw(fetcher: typeof fetch, url: string, init: RequestInit = {}, maxHops = 10): Promise<Response> {
     let current = url;
     let referer: string | undefined;
+    // 只有幂等的 GET/HEAD 允许瞬态网络错误重试：POST 全是 console 写操作或登录
+    // 流程，传输错误时服务端可能已 commit（结果未知），重试等于重复提交。
+    const method = (init.method ?? 'GET').toUpperCase();
+    const retryable = method === 'GET' || method === 'HEAD';
     for (let hop = 0; hop <= maxHops; hop += 1) {
       const headers = new Headers(init.headers);
       const cookieHeader = getCookieHeader(this.cookies, current);
@@ -679,7 +2137,18 @@ class MutableCookieJar {
       headers.set('user-agent', headers.get('user-agent') ?? DEFAULT_BROWSER_USER_AGENT);
       if (referer && !headers.has('referer')) headers.set('referer', referer);
 
-      const response = await fetcher(current, { ...init, headers, redirect: 'manual' });
+      let response: Response;
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          response = await fetcher(current, { ...init, headers, redirect: 'manual' });
+          break;
+        } catch (err) {
+          if (!retryable || attempt >= TRANSIENT_FETCH_RETRY_DELAYS_MS.length || !isLikelyTransientNetworkError(err)) {
+            throw err;
+          }
+          await sleep(TRANSIENT_FETCH_RETRY_DELAYS_MS[attempt]);
+        }
+      }
       this.loadFromResponse(current, response.headers);
       if (response.status >= 300 && response.status < 400) {
         const location = response.headers.get('location');
@@ -713,10 +2182,16 @@ class MutableCookieJar {
   }
 }
 
-class OpenPlatformApiError extends Error {
-  constructor(message: string, readonly payload: unknown) {
+export class OpenPlatformApiError extends Error {
+  constructor(message: string, readonly payload: unknown, readonly status: number) {
     super(message);
   }
+}
+
+function openPlatformOwnerAccessDenied(error: unknown): boolean {
+  if (!(error instanceof OpenPlatformApiError)) return false;
+  const payload = asRecord(error.payload);
+  return error.status === 403 && payload.code === 10003;
 }
 
 class FeishuWebSessionError extends Error {
@@ -797,36 +2272,60 @@ function mapScopeIds(scopeNames: string[], catalog: OpenPlatformScopeEntry[], bu
   return { ids: uniqueStrings(ids), missing };
 }
 
-function nextAppVersion(payload: unknown): string {
+/** 从 app_version/list 响应算下一个版本号（最新已发布 +1，无发布版 → 0.0.1）。 */
+export function nextAppVersion(payload: unknown): string {
   const data = asRecord(asRecord(payload).data);
   const versions = Array.isArray(data.versions) ? data.versions : [];
-  const published = versions
-    .map(item => asRecord(item))
-    .filter(item => item.versionStatus === 2)
-    .map(item => pickString(item, ['appVersion']))
-    .filter((version): version is string => Boolean(version));
-  if (published.length === 0) return '0.0.1';
-  const latest = published[0];
-  const parts = latest.split('.').map(part => Number.parseInt(part, 10));
-  if (parts.length < 3 || parts.some(part => !Number.isFinite(part))) return '0.0.1';
-  parts[parts.length - 1] += 1;
-  return parts.join('.');
+  // 取所有版本(含未发布草稿)里的最大三段号 +1——不能只看已发布版本:若存在
+  // 未发布草稿(如上架启用失败留下的 1.0.0),只看已发布会算出 0.0.1 撞车,导致
+  // 二次发版被平台以「版本号未递增」拒掉,应用永远停在未启用。
+  const triples = versions
+    .map(item => pickString(asRecord(item), ['appVersion']))
+    .filter((version): version is string => Boolean(version))
+    .map(version => version.split('.').map(part => Number.parseInt(part, 10)))
+    .filter(parts => parts.length === 3 && parts.every(part => Number.isFinite(part)));
+  if (triples.length === 0) return '0.0.1';
+  const max = triples.reduce((a, b) => {
+    for (let i = 0; i < 3; i++) {
+      if (b[i] !== a[i]) return b[i] > a[i] ? b : a;
+    }
+    return a;
+  });
+  return [max[0], max[1], max[2] + 1].join('.');
 }
 
-function extractContactRangeMemberIds(payload: unknown): string[] {
-  const data = asRecord(asRecord(payload).data);
-  const detail = asRecord(data.contactRangeDetail);
-  const members = Array.isArray(detail.members) ? detail.members : [];
-  return uniqueStrings(members
-    .map(item => pickString(asRecord(item), ['id']))
-    .filter((id): id is string => Boolean(id)));
-}
-
-function extractVersionId(payload: unknown): string | undefined {
+/** 从 app_version/create 响应提取 versionId（多种响应形态兼容）。 */
+export function extractVersionId(payload: unknown): string | undefined {
   const direct = pickString(asRecord(payload), ['versionId', 'version_id', 'id']);
   if (direct) return direct;
   const data = asRecord(asRecord(payload).data);
   return pickString(data, ['versionId', 'version_id', 'id']) ?? pickString(asRecord(data.appVersion), ['versionId', 'version_id', 'id']);
+}
+
+function extractBalancedJsonObject(input: string, start: number): string | null {
+  if (input[start] !== '{') return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < input.length; i += 1) {
+    const char = input[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+    if (char === '{') depth += 1;
+    else if (char === '}') {
+      depth -= 1;
+      if (depth === 0) return input.slice(start, i + 1);
+    }
+  }
+  return null;
 }
 
 function pickString(record: Record<string, unknown>, keys: string[]): string | undefined {
@@ -946,9 +2445,26 @@ function summarizeOpenPlatformPayload(payload: unknown): string {
   return JSON.stringify(summary).slice(0, 500);
 }
 
-function safeErrorMessage(err: unknown): string {
-  const message = err instanceof Error ? err.message : String(err);
-  return message.replace(/[A-Za-z0-9_=-]{24,}/g, '***');
+export function safeErrorMessage(err: unknown): string {
+  // undici 把网络失败包成 TypeError('fetch failed', { cause })，真实原因
+  // （ECONNRESET / EAI_AGAIN / 具体地址等）全在 cause 链里——不带上它，用户和
+  // 排障方永远只能看到一句 "fetch failed"。
+  const parts: string[] = [];
+  let current: unknown = err;
+  for (let depth = 0; depth < 4 && current !== undefined && current !== null; depth += 1) {
+    if (current instanceof AggregateError && !current.message && current.errors.length > 0) {
+      current = current.errors[0];
+    }
+    const message = current instanceof Error ? current.message : String(current);
+    const code = (current as { code?: unknown }).code;
+    const part = typeof code === 'string' && code && !message.includes(code)
+      ? (message ? `${message} (${code})` : code)
+      : message;
+    if (part && parts[parts.length - 1] !== part) parts.push(part);
+    current = current instanceof Error ? current.cause : undefined;
+  }
+  const combined = parts.join(': ') || (err instanceof Error ? err.message : String(err));
+  return combined.replace(/[A-Za-z0-9_=-]{24,}/g, '***');
 }
 
 function markFinalResponseUrl(response: Response, finalUrl: string): void {

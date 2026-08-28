@@ -15,6 +15,7 @@
  */
 
 import { config } from '../../config.js';
+import { buildV3RunDetailUrl } from '../../core/dashboard-url.js';
 
 export const V3_REVISIT_GRANT_ACTION = 'v3_revisit_grant';
 
@@ -58,7 +59,7 @@ export function v3RevisitGrantCardNonce(runId: string, sourceNodeId: string, att
 }
 
 function v3RunDetailUrl(runId: string): string {
-  return `http://${config.dashboard.externalHost}:${config.dashboard.port}/#/v3/${encodeURIComponent(runId)}`;
+  return buildV3RunDetailUrl(runId, { host: config.dashboard.externalHost, port: config.dashboard.port });
 }
 
 export function buildV3RevisitGrantCard(input: V3RevisitGrantCardInput): string {
@@ -136,7 +137,7 @@ export function buildV3RevisitGrantCard(input: V3RevisitGrantCardInput): string 
     actions: [
       {
         tag: 'button',
-        text: { tag: 'plain_text', content: 'Web 详情' },
+        text: { tag: 'plain_text', content: 'Web 详情（需登录）' },
         type: 'default',
         multi_url: { url: webDetailUrl, pc_url: webDetailUrl, android_url: webDetailUrl, ios_url: webDetailUrl },
       },

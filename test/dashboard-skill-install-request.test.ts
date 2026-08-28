@@ -1,11 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
-import { MAX_LOCAL_LINK_SOURCES, parseDashboardSkillInstallRequest, parseInstallLocalLinksSources, shouldAutoLinkLocalSkillPath } from '../src/dashboard/skill-install-request.js';
+import { MAX_LOCAL_LINK_SOURCES, discoverDashboardSkills, parseDashboardSkillInstallRequest, parseInstallLocalLinksSources, shouldAutoLinkLocalSkillPath } from '../src/dashboard/skill-install-request.js';
 
 describe('dashboard skill install request parsing', () => {
   it('rejects lightweight install errors before starting a job', () => {
     expect(() => parseDashboardSkillInstallRequest({ source: '' })).toThrow(/source_required/);
-    expect(() => parseDashboardSkillInstallRequest({ source: 'git+https://github.com/acme/skills.git' })).toThrow(/path_required/);
     expect(() => parseDashboardSkillInstallRequest({
       source: 'git+https://token@example.com/acme/skills.git',
       path: 'skills/deploy',
@@ -14,6 +13,25 @@ describe('dashboard skill install request parsing', () => {
       source: 'git+https://github.com/acme/skills.git',
       path: '../deploy',
     })).toThrow(/invalid_git_skill_path/);
+  });
+
+  it('accepts repository roots for discovery-backed remote installs', () => {
+    expect(parseDashboardSkillInstallRequest({ source: 'git+https://github.com/acme/skills.git' })).toMatchObject({
+      kind: 'git',
+      url: 'https://github.com/acme/skills.git',
+    });
+    expect(parseDashboardSkillInstallRequest({ source: 'https://github.com/acme/skills' })).toMatchObject({
+      kind: 'github',
+      owner: 'acme',
+      repo: 'skills',
+    });
+    expect(parseDashboardSkillInstallRequest({
+      source: 'https://github.com/acme/skills',
+      skillNames: ['deploy', 'review'],
+    })).toMatchObject({
+      kind: 'github',
+      skillNames: ['deploy', 'review'],
+    });
   });
 
   it('parses GitHub shorthand paths and explicit overrides', () => {
@@ -52,6 +70,24 @@ describe('dashboard skill install request parsing', () => {
       path: 'skills/runbook',
       ref: 'main',
     });
+  });
+
+  it('routes agentbuddy command sources to the direct-install (no discover) path', () => {
+    expect(parseDashboardSkillInstallRequest({ source: 'agentbuddy skill add example.com/team/mkt --skill deploy --version 1.2.3' })).toEqual({
+      kind: 'agentbuddy',
+      agentbuddy: { protocol: 'skill', group: 'example.com/team/mkt', skill: 'deploy', version: '1.2.3' },
+    });
+    expect(parseDashboardSkillInstallRequest({ source: 'agentbuddy plugin collection add col123abc' })).toEqual({
+      kind: 'agentbuddy',
+      agentbuddy: { protocol: 'plugin', collection: 'col123abc' },
+    });
+  });
+
+  it('routes a pasted agentbuddy command to direct-install', async () => {
+    const request = parseDashboardSkillInstallRequest({ source: 'agentbuddy skill collection add abc123' });
+    expect(request).toEqual({ kind: 'agentbuddy', agentbuddy: { protocol: 'skill', collection: 'abc123' } });
+    // discover signals the UI to install directly (skip discover-then-select)
+    expect(await discoverDashboardSkills(request)).toEqual({ skills: [], directInstall: true });
   });
 
   it('sanitizes batch local-link sources: trims, drops blanks/non-strings, dedups', () => {

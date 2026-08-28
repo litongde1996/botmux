@@ -42,7 +42,12 @@ const CODEX_HAS_TRUST_DIALOG = codexEmitsTrustDialog();
 // ─── Constants (match production worker.ts) ─────────────────────────────────
 
 const CODEX_BIN = 'codex';
-const CODEX_ARGS = ['--no-alt-screen', '--dangerously-bypass-approvals-and-sandbox'];
+// Mirror production codex.ts baseArgs for the DEFAULT launch (bypassCodexHookTrust
+// toggle ON, unrestricted bot): bypass both the approval/sandbox gate AND the 0.14x
+// interactive hook-trust gate ("Press t to trust"). Without the latter the
+// not-version-gated "control" test below wedges on codex ≥0.14x whenever the botmux
+// hooks in ~/.codex/hooks.json are modified-since-last-trusted.
+const CODEX_ARGS = ['--no-alt-screen', '--dangerously-bypass-approvals-and-sandbox', '--dangerously-bypass-hook-trust'];
 const PTY_COLS = 300;
 const PTY_ROWS = 50;
 const TEST_PROMPT = 'just say the word PONG and nothing else';
@@ -143,7 +148,7 @@ describe('Codex first input submission', () => {
     /**
      * Simulates the full production worker flow:
      * 1. Codex spawns → trust dialog appears
-     * 2. Worker detects "Yes, continue" per-chunk → sends \r
+     * 2. Worker detects "Yes, continue" per-chunk → defers 400ms, then sends \r
      * 3. IdleDetector waits for codex to finish loading
      * 4. Idle fires → prompt is written to the actual input box
      * 5. Prompt is submitted successfully
@@ -181,13 +186,16 @@ describe('Codex first input submission', () => {
         stripped,
       });
 
-      // Production trust detection (per-chunk, with fixed pattern)
+      // Production trust detection (per-chunk, with fixed pattern). Codex
+      // 0.149 drops a synchronous Enter (upstream openai/codex#39487), so
+      // production defers the keystroke 400ms after detection — replicate
+      // that timing here.
       if (!trustHandled) {
         if (TRUST_DIALOG_PATTERN.test(stripped)) {
           trustHandled = true;
           trustDetectedAt = Date.now();
-          console.log(`>>> Trust detected at +${trustDetectedAt - spawnTime}ms, dismissing...`);
-          proc!.write('\r');
+          console.log(`>>> Trust detected at +${trustDetectedAt - spawnTime}ms, dismissing in 400ms...`);
+          setTimeout(() => { proc!.write('\r'); }, 400);
           return; // skip idle detector feed (same as production)
         }
       }

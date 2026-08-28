@@ -2,10 +2,13 @@ import { describe, expect, it } from 'vitest';
 import {
   parseVersion,
   isStableVersion,
+  isCanonicalStableVersion,
   compareVersions,
   isNewerVersion,
   selectReleasesSince,
   fetchLatestVersion,
+  selectRollbackVersions,
+  fetchRollbackVersions,
   fetchReleasesSince,
 } from '../src/core/update-check.js';
 
@@ -30,6 +33,18 @@ describe('isStableVersion', () => {
     expect(isStableVersion('2.85.1')).toBe(true);
     expect(isStableVersion('2.85.1-canary.0')).toBe(false);
     expect(isStableVersion('nope')).toBe(false);
+  });
+});
+
+describe('isCanonicalStableVersion', () => {
+  it('accepts only canonical X.Y.Z package versions', () => {
+    expect(isCanonicalStableVersion('3.0.0')).toBe(true);
+    expect(isCanonicalStableVersion('v3.0.0')).toBe(false);
+    expect(isCanonicalStableVersion('03.0.0')).toBe(false);
+    expect(isCanonicalStableVersion('3.0.0-canary.0')).toBe(false);
+    expect(isCanonicalStableVersion('3.0.0 ')).toBe(false);
+    expect(isCanonicalStableVersion('file:../botmux')).toBe(false);
+    expect(isCanonicalStableVersion('9007199254740992.0.0')).toBe(false);
   });
 });
 
@@ -125,6 +140,65 @@ describe('fetchLatestVersion', () => {
   });
 });
 
+describe('rollback versions', () => {
+  const packument = {
+    versions: {
+      '2.84.0': { version: '2.84.0' },
+      '2.85.0': { version: '2.85.0' },
+      '2.85.1-canary.0': { version: '2.85.1-canary.0' },
+      '2.85.1': { version: '2.85.1' },
+      '3.0.0': { version: '3.0.0' },
+    },
+    time: {
+      '2.84.0': '2026-06-18T00:00:00Z',
+      '2.85.0': '2026-06-19T00:00:00Z',
+      '2.85.1': '2026-06-20T00:00:00Z',
+      '3.0.0': '2026-06-21T00:00:00Z',
+    },
+  };
+
+  it('selects only older stable versions, newest first, with publish dates', () => {
+    expect(selectRollbackVersions(packument, '3.0.0', 2)).toEqual([
+      { version: '2.85.1', publishedAt: '2026-06-20T00:00:00Z' },
+      { version: '2.85.0', publishedAt: '2026-06-19T00:00:00Z' },
+    ]);
+  });
+
+  it('does not offer the current, newer, or prerelease versions', () => {
+    expect(selectRollbackVersions(packument, '2.85.1').map(item => item.version)).toEqual(['2.85.0', '2.84.0']);
+  });
+
+  it('keeps a published version when its date is missing', () => {
+    expect(selectRollbackVersions({ versions: { '2.85.0': { version: '2.85.0' } } }, '3.0.0')).toEqual([
+      { version: '2.85.0', publishedAt: null },
+    ]);
+  });
+
+  it('rejects a packument entry whose manifest version does not match its key', () => {
+    expect(selectRollbackVersions({ versions: { '2.85.0': { version: 'file:../botmux' } } }, '3.0.0')).toEqual([]);
+  });
+
+  it('fetches and filters the registry packument', async () => {
+    const out = await fetchRollbackVersions('3.0.0', {
+      fetchImpl: async () => jsonResponse(200, packument),
+      max: 1,
+    });
+    expect(out).toEqual({
+      ok: true,
+      versions: [{ version: '2.85.1', publishedAt: '2026-06-20T00:00:00Z' }],
+    });
+  });
+
+  it('reports registry and malformed-response failures', async () => {
+    expect(await fetchRollbackVersions('3.0.0', { fetchImpl: async () => jsonResponse(503, {}) }))
+      .toEqual({ ok: false, versions: [] });
+    expect(await fetchRollbackVersions('3.0.0', { fetchImpl: async () => jsonResponse(200, {}) }))
+      .toEqual({ ok: false, versions: [] });
+    expect(await fetchRollbackVersions('3.0.0', { fetchImpl: async () => { throw new Error('offline'); } }))
+      .toEqual({ ok: false, versions: [] });
+  });
+});
+
 describe('fetchReleasesSince', () => {
   it('maps + filters the releases array (ok:true)', async () => {
     const releases = [{ tag_name: 'v2.85.1', body: 'n', html_url: 'u', published_at: 'x' }];
@@ -132,6 +206,51 @@ describe('fetchReleasesSince', () => {
     expect(out.ok).toBe(true);
     expect(out.releases.map(r => r.version)).toEqual(['2.85.1']);
   });
+
+  it('adds GitHub bearer auth when githubToken is configured', async () => {
+    let auth: string | null = null;
+    await fetchReleasesSince('2.85.0', {
+      auth: { env: { GITHUB_TOKEN: ' ghp_secret ' }, envFilePath: null },
+      fetchImpl: async (_input, init) => {
+        const headers = init?.headers as Record<string, string> | undefined;
+        auth = headers?.Authorization ?? headers?.authorization ?? null;
+        return jsonResponse(200, []);
+      },
+    });
+    expect(auth).toBe('Bearer ghp_secret');
+  });
+
+  it('omits GitHub bearer auth when githubToken is blank', async () => {
+    let auth: string | null = 'present';
+    await fetchReleasesSince('2.85.0', {
+      auth: { env: { GITHUB_TOKEN: '   ' }, envFilePath: null },
+      fetchImpl: async (_input, init) => {
+        const headers = init?.headers as Record<string, string> | undefined;
+        auth = headers?.Authorization ?? headers?.authorization ?? null;
+        return jsonResponse(200, []);
+      },
+    });
+    expect(auth).toBeNull();
+  });
+
+  it('uses env-file auth fallback when process env is unset', async () => {
+    let auth: string | null = null;
+    await fetchReleasesSince('2.85.0', {
+      auth: {
+        env: {},
+        envFilePath: '/tmp/global.env',
+        fileExists: () => true,
+        readTextFile: () => 'GITHUB_TOKEN=ghp_from_file\n',
+      },
+      fetchImpl: async (_input, init) => {
+        const headers = init?.headers as Record<string, string> | undefined;
+        auth = headers?.Authorization ?? headers?.authorization ?? null;
+        return jsonResponse(200, []);
+      },
+    });
+    expect(auth).toBe('Bearer ghp_from_file');
+  });
+
   it('ok:true with an empty list when already latest (genuinely empty)', async () => {
     const out = await fetchReleasesSince('2.85.1', { fetchImpl: async () => jsonResponse(200, [{ tag_name: 'v2.85.1' }]) });
     expect(out).toMatchObject({ ok: true, releases: [] });

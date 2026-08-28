@@ -7,6 +7,7 @@
  * failure (offline, rate-limited, registry hiccup) so the card degrades to
  * "couldn't check" rather than erroring. The version math is pure (unit tested).
  */
+import { githubAuthHeaders, type GithubAuthResolveOptions } from './github-auth.js';
 import { GITHUB_REPO } from './restart-report.js';
 
 export interface ReleaseNote {
@@ -47,6 +48,13 @@ export function parseVersion(raw: string): ParsedVersion | null {
 export function isStableVersion(raw: string): boolean {
   const v = parseVersion(raw);
   return !!v && v.pre.length === 0;
+}
+
+/** Canonical stable package version accepted from a privileged API body. */
+export function isCanonicalStableVersion(raw: string): boolean {
+  if (typeof raw !== 'string' || raw.length > 32) return false;
+  const match = raw.match(/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/);
+  return !!match && match.slice(1).every(part => Number.isSafeInteger(Number(part)));
 }
 
 /**
@@ -95,15 +103,17 @@ function vtag(v: string): string {
 }
 
 const REGISTRY_LATEST_URL = 'https://registry.npmjs.org/botmux/latest';
+const REGISTRY_PACKUMENT_URL = 'https://registry.npmjs.org/botmux';
 
 export interface FetchOpts {
   timeoutMs?: number;
   fetchImpl?: typeof fetch;
+  auth?: GithubAuthResolveOptions;
 }
 
 /**
- * The npm `latest` dist-tag version — the authoritative target of
- * `npm install -g botmux@latest`. null on any failure (offline, non-200,
+ * The npm registry's `latest` dist-tag version — the authoritative target for
+ * both npm and pnpm updates. null on any failure (offline, non-200,
  * malformed body, or a version string we can't parse).
  */
 export async function fetchLatestVersion(opts?: FetchOpts): Promise<string | null> {
@@ -118,6 +128,61 @@ export async function fetchLatestVersion(opts?: FetchOpts): Promise<string | nul
     return typeof body?.version === 'string' && parseVersion(body.version) ? body.version : null;
   } catch {
     return null;
+  }
+}
+
+export interface RollbackVersion {
+  version: string;
+  publishedAt: string | null;
+}
+
+export interface RollbackVersionsResult {
+  ok: boolean;
+  versions: RollbackVersion[];
+}
+
+/** Stable published versions older than `current`, newest first. */
+export function selectRollbackVersions(raw: unknown, current: string, max = 3): RollbackVersion[] {
+  if (!raw || typeof raw !== 'object') return [];
+  const packument = raw as Record<string, unknown>;
+  if (!packument.versions || typeof packument.versions !== 'object') return [];
+  const time = packument.time && typeof packument.time === 'object'
+    ? packument.time as Record<string, unknown>
+    : {};
+  return Object.entries(packument.versions as Record<string, unknown>)
+    .filter(([version, manifest]) => isCanonicalStableVersion(version)
+      && !!manifest
+      && typeof manifest === 'object'
+      && (manifest as Record<string, unknown>).version === version
+      && compareVersions(version, current) < 0)
+    .map(([version]) => version)
+    .sort((a, b) => compareVersions(b, a))
+    .slice(0, max)
+    .map(version => ({
+      version,
+      publishedAt: typeof time[version] === 'string' ? time[version] : null,
+    }));
+}
+
+/** Fetch the npm packument used to offer an allow-listed rollback target. */
+export async function fetchRollbackVersions(
+  current: string,
+  opts?: FetchOpts & { max?: number },
+): Promise<RollbackVersionsResult> {
+  const fetchImpl = opts?.fetchImpl ?? fetch;
+  try {
+    const res = await fetchImpl(REGISTRY_PACKUMENT_URL, {
+      headers: { Accept: 'application/json', 'User-Agent': 'botmux' },
+      signal: AbortSignal.timeout(opts?.timeoutMs ?? 8_000),
+    });
+    if (!res.ok) return { ok: false, versions: [] };
+    const raw = await res.json();
+    if (!raw || typeof raw !== 'object' || !(raw as Record<string, unknown>).versions) {
+      return { ok: false, versions: [] };
+    }
+    return { ok: true, versions: selectRollbackVersions(raw, current, opts?.max ?? 3) };
+  } catch {
+    return { ok: false, versions: [] };
   }
 }
 
@@ -144,7 +209,11 @@ export async function fetchReleasesSince(
   const fetchImpl = opts?.fetchImpl ?? fetch;
   try {
     const res = await fetchImpl(`https://api.github.com/repos/${GITHUB_REPO}/releases?per_page=100`, {
-      headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'botmux' },
+      headers: {
+        Accept: 'application/vnd.github+json',
+        'User-Agent': 'botmux',
+        ...githubAuthHeaders(opts?.auth),
+      },
       signal: AbortSignal.timeout(opts?.timeoutMs ?? 8_000),
     });
     if (!res.ok) return { ok: false, rateLimited: res.status === 403, releases: [] };

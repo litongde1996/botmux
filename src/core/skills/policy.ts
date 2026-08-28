@@ -3,16 +3,22 @@ import type {
   ResolvedSkill,
   SkillDiagnostic,
   SkillPackage,
+  SkillPack,
   SkillSelector,
 } from './types.js';
 
 export interface SkillPolicyInput {
   registrySkills: SkillPackage[];
   projectSkills: SkillPackage[];
+  pluginSkills?: SkillPackage[];
   globalProjectSkills?: 'off' | 'trusted' | 'all';
   globalDelivery?: 'auto' | 'prompt' | 'native';
   botPolicy: BotSkillPolicy | undefined;
   workingDir: string;
+  /** Skill pack registry used to expand `pack:<id>` selectors. When absent,
+   *  `pack:*` selectors resolve to nothing and emit a `pack_not_found`
+   *  diagnostic, so callers that don't know about packs still behave safely. */
+  packs?: Record<string, SkillPack>;
 }
 
 export interface SkillPolicyResult {
@@ -36,9 +42,14 @@ function appendMatches(out: ResolvedSkill[], skills: SkillPackage[], selector: S
   }
 }
 
+function skillNameFromSelector(selector: SkillSelector): string {
+  return selector.slice('skill:'.length);
+}
+
 export function resolveSkillPolicy(input: SkillPolicyInput): SkillPolicyResult {
   const policy = input.botPolicy;
-  if (!policy) {
+  const pluginSkills = input.pluginSkills ?? [];
+  if (!policy && pluginSkills.length === 0) {
     return { enabled: false, mode: 'priority', delivery: 'auto', prioritySkills: [], diagnostics: [] };
   }
 
@@ -56,10 +67,76 @@ export function resolveSkillPolicy(input: SkillPolicyInput): SkillPolicyResult {
     candidates.push(...input.projectSkills);
   }
 
+  // Keep the same source precedence as direct selectors: registry candidates
+  // are appended before project candidates, so the first package with a name
+  // must win for both `skill:*` and pack-expanded references.
+  const candidateByName = new Map<string, SkillPackage>();
+  for (const skill of candidates) {
+    if (!candidateByName.has(skill.name)) candidateByName.set(skill.name, skill);
+  }
   const raw: ResolvedSkill[] = [];
-  for (const selector of policy.include ?? []) {
-    if (!selector.startsWith('skill:')) continue;
+
+  // Partition the include array so direct `skill:*` references are ALWAYS
+  // expanded before `pack:*` references, regardless of the order the user wrote
+  // them in. This guarantees "direct always wins": a skill explicitly attached
+  // to a bot shadows the same skill pulled in via a pack, even if the pack
+  // selector appears first in the array. Within each partition the original
+  // policy order is preserved for stable, predictable resolution.
+  const include = policy?.include ?? [];
+  const directSelectors = include.filter((s) => s.startsWith('skill:'));
+  const packSelectors = include.filter((s) => s.startsWith('pack:'));
+
+  for (const selector of directSelectors) {
     appendMatches(raw, candidates, selector, 'bot:include');
+  }
+  for (const selector of packSelectors) {
+    const packId = selector.slice('pack:'.length);
+    const pack = input.packs && Object.hasOwn(input.packs, packId)
+      ? input.packs[packId]
+      : undefined;
+    if (!pack) {
+      diagnostics.push({
+        level: 'warn',
+        code: 'pack_not_found',
+        message: `Skill pack not found: ${packId}`,
+      });
+      continue;
+    }
+    if (!Array.isArray(pack.include)) {
+      diagnostics.push({
+        level: 'warn',
+        code: 'pack_invalid',
+        message: `Skill pack "${packId}" has no valid include list`,
+      });
+      continue;
+    }
+    for (const member of pack.include) {
+      if (typeof member !== 'string' || !/^skill:.+$/.test(member)) {
+        diagnostics.push({
+          level: 'warn',
+          code: 'pack_invalid',
+          message: `Skill pack "${packId}" contains a non-skill selector: ${String(member)}`,
+        });
+        continue;
+      }
+      const skillName = skillNameFromSelector(member);
+      const skill = candidateByName.get(skillName);
+      if (!skill) {
+        diagnostics.push({
+          level: 'warn',
+          code: 'pack_skill_missing',
+          message: `Skill pack "${packId}" references missing skill: ${skillName}`,
+          skillName,
+        });
+        continue;
+      }
+      raw.push({ ...skill, priorityReason: `bot:pack:${packId}` });
+    }
+  }
+
+  for (const skill of pluginSkills) {
+    const reason = skill.source.type === 'plugin' ? `plugin:${skill.source.pluginId}` : 'plugin';
+    raw.push({ ...skill, priorityReason: reason });
   }
 
   const seen = new Set<string>();

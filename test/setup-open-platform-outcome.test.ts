@@ -1,0 +1,132 @@
+import { describe, expect, it } from 'vitest';
+import {
+  blocksSetupBotStart,
+  classifySetupOpenPlatformOutcome,
+  scriptedSetupOpenPlatformReuseOnly,
+  setupOpenPlatformOutcomeJson,
+  setupOpenPlatformRetryCommand,
+} from '../src/setup/open-platform-outcome.js';
+import type { OpenPlatformAutomationResult } from '../src/setup/open-platform-automation.js';
+
+function success(overrides: Partial<Extract<OpenPlatformAutomationResult, { ok: true }>> = {}) {
+  return {
+    ok: true as const,
+    sessionFile: '/tmp/session.json',
+    sessionSource: 'botmux_cache' as const,
+    cookieCount: 2,
+    scopeCount: 3,
+    skippedScopeCount: 0,
+    subscribedEventCount: 2,
+    missingVcEvents: [],
+    eventModeReady: true,
+    // 一个真正的 ready 必须**同时**包含「redirect 白名单已写上」：这是 ok:true 结果
+    // 里的必填字段，缺了它 bot 一点授权就 20029。
+    redirectConfigured: true,
+    versionId: 'v1',
+    ...overrides,
+  };
+}
+
+describe('classifySetupOpenPlatformOutcome', () => {
+  it('distinguishes ready and warning-bearing success', () => {
+    expect(classifySetupOpenPlatformOutcome(success()).status).toBe('ready');
+    expect(classifySetupOpenPlatformOutcome(success({ scopeWarning: 'partial scope grant' })).status)
+      .toBe('ready_with_warnings');
+    expect(classifySetupOpenPlatformOutcome(success({ scopeCount: 0 })).status)
+      .toBe('ready_with_warnings');
+    expect(classifySetupOpenPlatformOutcome(success({ skippedScopeCount: 1 })).status)
+      .toBe('ready_with_warnings');
+    expect(classifySetupOpenPlatformOutcome(success({ versionId: undefined })).status)
+      .toBe('ready_with_warnings');
+  });
+
+  it('redirect 白名单没写上时不许报成纯 ready', () => {
+    // 权限、事件、发版全绿也没用：白名单缺条目 = authorize 硬失败 20029
+    //（群聊模式 p2pMode=group / 会话群标签 / `/login` 全都授权不了）。
+    expect(classifySetupOpenPlatformOutcome(success({ redirectConfigured: false })).status)
+      .toBe('ready_with_warnings');
+    expect(classifySetupOpenPlatformOutcome(
+      success({ redirectConfigured: false, redirectWarning: '写入 redirect 白名单失败: code=1' }),
+    ).status).toBe('ready_with_warnings');
+    // 读不到现值 → 零写入的降级路径同样带 warning，一样不能算 ready。
+    expect(classifySetupOpenPlatformOutcome(
+      success({ redirectWarning: '读不到开放平台现有 redirect 白名单，本次未写入' }),
+    ).status).toBe('ready_with_warnings');
+  });
+
+  it('keeps Lark compatibility manual without treating it as a Feishu failure', () => {
+    const outcome = classifySetupOpenPlatformOutcome({
+      ok: false,
+      reason: 'unsupported_brand',
+      message: 'only feishu is automated',
+    });
+    expect(outcome.status).toBe('manual');
+    expect(blocksSetupBotStart(outcome)).toBe(false);
+  });
+
+  it('blocks bot start for critical Feishu automation failures and serializes details', () => {
+    const outcome = classifySetupOpenPlatformOutcome({
+      ok: false,
+      reason: 'api_error',
+      message: 'event callback missing',
+      sessionFile: '/tmp/session.json',
+      eventModeReady: false,
+    });
+    expect(outcome.status).toBe('failed');
+    expect(blocksSetupBotStart(outcome)).toBe(true);
+    expect(setupOpenPlatformOutcomeJson(outcome)).toEqual({
+      status: 'failed',
+      reason: 'api_error',
+      message: 'event callback missing',
+      sessionFile: '/tmp/session.json',
+      eventModeReady: false,
+    });
+    expect(setupOpenPlatformRetryCommand('cli_x', outcome)).toBe('botmux setup configure cli_x');
+  });
+
+  it('does not offer a deterministic retry loop for manual Lark setup', () => {
+    const outcome = classifySetupOpenPlatformOutcome({
+      ok: false,
+      reason: 'unsupported_brand',
+      message: 'only feishu is automated',
+    });
+    expect(setupOpenPlatformRetryCommand('cli_lark', outcome)).toBeUndefined();
+  });
+
+  it('adds --switch-account when a cached web session cannot make progress', () => {
+    const outcome = classifySetupOpenPlatformOutcome({
+      ok: false,
+      reason: 'invalid_session',
+      message: 'cache expired',
+    });
+    expect(setupOpenPlatformRetryCommand('cli_x', outcome))
+      .toBe('botmux setup configure cli_x --switch-account');
+  });
+
+  it('keeps every scripted JSON automation path QR-free by default', () => {
+    expect(scriptedSetupOpenPlatformReuseOnly({
+      json: true,
+      createApp: false,
+      compatibilityMode: false,
+      brand: 'feishu',
+    })).toBe(true);
+    expect(scriptedSetupOpenPlatformReuseOnly({
+      json: false,
+      createApp: true,
+      compatibilityMode: false,
+      brand: 'feishu',
+    })).toBe(true);
+    expect(scriptedSetupOpenPlatformReuseOnly({
+      json: false,
+      createApp: false,
+      compatibilityMode: false,
+      brand: 'feishu',
+    })).toBe(false);
+    expect(scriptedSetupOpenPlatformReuseOnly({
+      json: true,
+      createApp: false,
+      compatibilityMode: false,
+      brand: 'lark',
+    })).toBe(false);
+  });
+});

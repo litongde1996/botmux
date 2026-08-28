@@ -24,7 +24,7 @@ import { findCocoSessionByPid } from '../services/coco-transcript.js';
 import { findTraexRolloutByPid } from '../services/traex-transcript.js';
 import { findServerPid } from '../adapters/backend/zellij-backend.js';
 import {
-  listLiveSessions, parseListPanesJson,
+  listLiveSessions, parseListPanesJson, type ListedPane,
 } from './zellij-session-discovery.js';
 import { zellijEnv } from '../setup/ensure-zellij.js';
 import { logger } from '../utils/logger.js';
@@ -52,8 +52,8 @@ function canonPath(p: string | undefined): string | undefined {
   return out.length > 1 && out.endsWith('/') ? out.slice(0, -1) : out;
 }
 
-function cliIdForProc(pid: number, filterCliId?: CliId): CliId | undefined {
-  return cliIdFromCommArgv(readComm(pid), readCmdline(pid), filterCliId);
+function cliIdForProc(pid: number, filterCliId?: CliId, filterExecutable?: string): CliId | undefined {
+  return cliIdFromCommArgv(readComm(pid), readCmdline(pid), filterCliId, filterExecutable);
 }
 
 /** BFS the process tree under rootPid collecting every known CLI process with
@@ -67,6 +67,7 @@ function findAllClisUnder(
   rootPid: number,
   maxDepth: number,
   filterCliId?: CliId,
+  filterExecutable?: string,
 ): Array<{ pid: number; cliId: CliId; cwd?: string }> {
   const found: Array<{ pid: number; cliId: CliId; cwd?: string }> = [];
   const parentOf = new Map<number, number>();
@@ -74,7 +75,7 @@ function findAllClisUnder(
   for (let depth = 0; depth <= maxDepth && current.length > 0; depth++) {
     const next: number[] = [];
     for (const pid of current) {
-      const cliId = cliIdForProc(pid, filterCliId);
+      const cliId = cliIdForProc(pid, filterCliId, filterExecutable);
       if (cliId) found.push({ pid, cliId, cwd: canonPath(readCwd(pid)) });
       for (const ch of getChildPids(pid)) { parentOf.set(ch, pid); next.push(ch); }
     }
@@ -136,6 +137,27 @@ function paneNum(paneId: string): number {
   return m ? Number(m[1]) : 0;
 }
 
+/**
+ * The pane set used for the positional pane↔pid alignment: every terminal pane
+ * that has a LIVE process behind it, sorted by pane id (= creation order).
+ *
+ * This must mirror exactly what `paneShellChildren` counts on the process side,
+ * or the count guard refuses the whole session. Two states used to break that
+ * invariant (both reproduced live — the "/adopt finds nothing" bug):
+ *  - FLOATING terminal panes have a pane shell like any tiled pane, so they
+ *    MUST be included (they were filtered out, leaving an extra child).
+ *  - EXITED held panes (`zellij run` command finished, pane kept for re-run)
+ *    have NO process left, so they must be excluded (they added a terminal
+ *    with no matching child).
+ * Floating panes are also perfectly adoptable — every drive/dump action takes
+ * an explicit --pane-id — so they stay in the results too.
+ */
+export function alignmentPanes(listed: ListedPane[]): ListedPane[] {
+  return listed
+    .filter(p => !p.isPlugin && !p.exited)
+    .sort((a, b) => paneNum(a.paneId) - paneNum(b.paneId));
+}
+
 /** Live pane dimensions (content area) for a paneId in a session. */
 function paneDimensions(session: string, paneId: string): { cols: number; rows: number } | undefined {
   try {
@@ -178,8 +200,12 @@ function resolveSessionId(cliId: CliId, pid: number): { sessionId?: string; star
 /**
  * Scan all live zellij sessions for adoptable CLIs. Skips bmx-* (botmux's own).
  * @param filterCliId only return sessions matching this CLI type.
+ * @param filterExecutable for a custom Codex runtime, require this executable's basename exactly.
  */
-export function discoverAdoptableZellijSessions(filterCliId?: CliId): ZellijAdoptableSession[] {
+export function discoverAdoptableZellijSessions(
+  filterCliId?: CliId,
+  filterExecutable?: string,
+): ZellijAdoptableSession[] {
   const results: ZellijAdoptableSession[] = [];
 
   for (const session of listLiveSessions()) {
@@ -187,9 +213,7 @@ export function discoverAdoptableZellijSessions(filterCliId?: CliId): ZellijAdop
 
     const panesOut = zellijRead(session, ['list-panes', '--json']);
     if (!panesOut) continue;
-    const terminals = parseListPanesJson(panesOut)
-      .filter(p => !p.isPlugin && !p.isFloating)
-      .sort((a, b) => paneNum(a.paneId) - paneNum(b.paneId));
+    const terminals = alignmentPanes(parseListPanesJson(panesOut));
     if (terminals.length === 0) continue;
 
     const serverPid = findServerPid(session);
@@ -202,20 +226,22 @@ export function discoverAdoptableZellijSessions(filterCliId?: CliId): ZellijAdop
     // specific CLI pid WITHOUT a cwd match, which is essential when several
     // panes/tabs run the SAME cli from the SAME dir (e.g. multiple `codex` in
     // ~): a cwd match is then ambiguous and silently drops them all (the bug
-    // 申晗 hit). Counts must match or the alignment is unreliable → refuse.
+    // reported issue). Counts must match or the alignment is unreliable → refuse.
     // paneShellChildren filters the transient ps/zellij-client processes that
     // briefly parent to the server during discovery (see its doc) — only
     // persistent pane shells/commands remain, so the count guard is stable.
     const children = paneShellChildren(serverPid);
     if (children.length !== terminals.length) {
-      logger.debug(`[zellij-adopt] ${session}: pane processes(${children.length}) != terminals(${terminals.length}) — can't align, refusing`);
+      // warn (not debug): this refusal makes every CLI in the session invisible
+      // to /adopt, so it must be diagnosable from live daemon logs.
+      logger.warn(`[zellij-adopt] ${session}: pane processes(${children.length}) != live terminals(${terminals.length}) — can't align, refusing`);
       continue;
     }
 
     for (let i = 0; i < terminals.length; i++) {
       // findAllClisUnder collapses the node-wrapper chain to the native CLI;
       // a bare shell pane yields none and is skipped.
-      const clis = findAllClisUnder(children[i]!, 4, filterCliId);
+      const clis = findAllClisUnder(children[i]!, 4, filterCliId, filterExecutable);
       if (clis.length === 0) continue;
       const cli = clis[0]!;
 
@@ -246,10 +272,16 @@ export function discoverAdoptableZellijSessions(filterCliId?: CliId): ZellijAdop
  *  `filterCliId` MUST mirror discovery's filter: a generic-named `agent` (Cursor)
  *  is only recognized as a CLI under the 'cursor' filter, so without it the
  *  expected pid is never re-identified and a live session looks exited. */
-export function validateZellijAdoptTarget(session: string, paneId: string, expectedPid: number, filterCliId?: CliId): boolean {
+export function validateZellijAdoptTarget(
+  session: string,
+  paneId: string,
+  expectedPid: number,
+  filterCliId?: CliId,
+  filterExecutable?: string,
+): boolean {
   const serverPid = findServerPid(session);
   if (!serverPid) return false;
-  const clis = findAllClisUnder(serverPid, 4, filterCliId);
+  const clis = findAllClisUnder(serverPid, 4, filterCliId, filterExecutable);
   if (!clis.some(c => c.pid === expectedPid)) return false;
   // And the pane must still exist.
   return paneDimensions(session, paneId) !== undefined;

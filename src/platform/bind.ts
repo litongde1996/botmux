@@ -5,8 +5,14 @@ import { randomBytes } from 'node:crypto';
 import { hostname, homedir } from 'node:os';
 import { join } from 'node:path';
 import { readPlatformBinding, writePlatformBinding } from './binding.js';
+import { postJson, type PostJsonResult } from './platform-http.js';
 import { callDashboard } from '../cli/dashboard-endpoint.js';
 import { readGlobalConfig, mergeGlobalConfig } from '../global-config.js';
+import { isManagedAgentHostCommandContext } from './host-command-context.js';
+
+export interface BindCommandDependencies {
+  isAgentContext?: () => boolean;
+}
 
 /** 解码平台生成的 bind blob：base64url(JSON{u:平台地址, t:绑定token})。 */
 function decodeBindBlob(blob: string): { platformUrl: string; token: string } | null {
@@ -21,7 +27,18 @@ function decodeBindBlob(blob: string): { platformUrl: string; token: string } | 
   return null;
 }
 
-export async function cmdBind(args: string[]): Promise<void> {
+export async function cmdBind(
+  args: string[],
+  dependencies: BindCommandDependencies = {},
+): Promise<void> {
+  // Refuse before parsing/decoding the one-time bind credential or touching the
+  // network. The OS mask is the security boundary; this guard prevents a user
+  // from accidentally handing a reusable host-authority command to an agent.
+  if ((dependencies.isAgentContext ?? isManagedAgentHostCommandContext)()) {
+    console.error('❌ botmux bind 只能在宿主终端执行；AI CLI 会话不能消费绑定凭证或修改机器归属。');
+    process.exitCode = 2;
+    return;
+  }
   let arg = '';
   let platformOverride = '';
   for (let i = 0; i < args.length; i++) {
@@ -59,26 +76,37 @@ export async function cmdBind(args: string[]): Promise<void> {
   const machineId = existing?.machineId || randomBytes(8).toString('hex');
   const name = existing?.name || hostname();
 
-  let res: Response;
-  try {
-    res = await fetch(`${platformUrl}/api/bind`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ code, machineId }),
-    });
-  } catch (e) {
-    // Node 的 fetch 把真正的网络原因塞在 e.cause 里，String(e) 只剩裸 "TypeError: fetch failed"，
-    // 对排查毫无帮助。把 cause（ENOTFOUND/ECONNREFUSED/超时/证书等）一并打出来。
-    const cause = (e as { cause?: unknown })?.cause;
-    const detail = cause ? `${String(e)} —— ${String(cause)}` : String(e);
-    console.error(`连接平台失败（${platformUrl}）: ${detail}`);
+  // 连平台：先走系统默认解析（happy-eyeballs 自动选路）；不通再依次用 IPv6 / IPv4 单协议族兜底
+  // （有的机器 IPv4 路由是坏的、但 IPv6 通，反之亦然）。隧道连接始终不传 family，让 Node
+  // 内置 happy-eyeballs 自动选最优路径，不把单族偏好固化到绑定文件里。
+  const bindUrl = `${platformUrl}/api/bind`;
+  const bindPayload = { code, machineId };
+  const attempts: Array<{ family?: 4 | 6; label: string }> = [
+    { label: '默认' },
+    { family: 6, label: 'IPv6' },
+    { family: 4, label: 'IPv4' },
+  ];
+  let res: PostJsonResult | null = null;
+  const failures: string[] = [];
+  for (const attempt of attempts) {
+    try {
+      res = await postJson(bindUrl, bindPayload, { family: attempt.family });
+      break;
+    } catch (e) {
+      const err = (e as { code?: string; message?: string });
+      failures.push(`${attempt.label}: ${err.code || err.message || String(e)}`);
+    }
+  }
+  if (!res) {
+    console.error(`连接平台失败（${platformUrl}）:`);
+    for (const f of failures) console.error(`  ${f}`);
     console.error('  多为临时网络抖动或平台正在发布；请确认本机能访问平台域名后重试 `botmux bind`（重绑安全、幂等，机器身份不变）。');
     process.exit(1);
     return;
   }
 
-  const body = (await res.json().catch(() => ({}))) as { machineId?: string; machineToken?: string; error?: string };
-  if (!res.ok || !body.machineToken) {
+  const body = res.json as { machineId?: string; machineToken?: string; error?: string };
+  if (res.status < 200 || res.status >= 300 || !body.machineToken) {
     const reason = body.error || `HTTP ${res.status}`;
     console.error(`绑定失败: ${reason}`);
     if (reason.includes('invalid') || reason.includes('expired')) console.error('  绑定凭证无效或已过期，请回平台重新生成。');
@@ -123,6 +151,8 @@ export async function cmdBind(args: string[]): Promise<void> {
     });
     if (cur.ok) {
       console.log(`  面板: ${cur.url}`);
+      // 附带本地直连兜底：中心化平台异常时仍可直接 ip:port 访问 dashboard。
+      if (cur.localUrl) console.log(`  本地直连(平台异常时可用): ${cur.localUrl}`);
     } else {
       console.log('  面板: 运行 `botmux dashboard` 获取中心化平台链接。');
     }

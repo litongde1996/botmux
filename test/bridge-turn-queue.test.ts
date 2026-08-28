@@ -13,7 +13,7 @@
  *     yet (e.g. Claude is still in tool-use mid-turn)
  */
 import { describe, it, expect } from 'vitest';
-import { BridgeTurnQueue, makeFingerprint } from '../src/services/bridge-turn-queue.js';
+import { BridgeTurnQueue, makeFingerprint, isTruncatedMatch } from '../src/services/bridge-turn-queue.js';
 import { shouldSuppressBridgeEmit, type BridgeSendMarker } from '../src/services/bridge-fallback-gate.js';
 import type { TranscriptEvent } from '../src/services/claude-transcript.js';
 
@@ -64,6 +64,156 @@ describe('BridgeTurnQueue', () => {
     expect(ready[0].turnId).toBe('t1');
     expect(ready[0].assistantUuids).toEqual(['a1']);
     expect(q.size()).toBe(0);
+  });
+
+  it('does not attribute a rate_limit API-error record as the turn reply', () => {
+    // The rate_limit record is type:"assistant" with a human text block, but
+    // the worker surfaces it as a `limited` state; it must NOT become the
+    // turn's assistantUuids (that would forward the raw error line to Lark).
+    const q = new BridgeTurnQueue();
+    q.mark('t1');
+    const rateErr: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'rl1',
+      isApiErrorMessage: true,
+      error: 'rate_limit',
+      apiErrorStatus: 429,
+      message: { role: 'assistant', content: [{ type: 'text', text: "You've hit your session limit · resets 10:40pm" }], stop_reason: 'stop_sequence' },
+    };
+    q.ingest([user('u1'), rateErr]);
+    // Turn started (user matched) but collected no real reply → held back,
+    // not emitted with the error text.
+    expect(q.peek()[0]?.assistantUuids ?? []).toEqual([]);
+    expect(q.drainEmittable()).toEqual([]);
+  });
+
+  it('keeps 429 on the limited path when turn_duration follows it', () => {
+    const q = new BridgeTurnQueue();
+    q.mark('om_limited');
+    q.ingest([
+      user('u-limit'),
+      {
+        type: 'assistant',
+        uuid: 'rl-duration',
+        isApiErrorMessage: true,
+        error: 'rate_limit',
+        apiErrorStatus: 429,
+        message: { role: 'assistant', content: [], stop_reason: 'stop_sequence' },
+      },
+      { type: 'system', subtype: 'turn_duration', uuid: 'duration-limit' },
+    ]);
+
+    expect(q.drainEmittable({ explicitTerminalOnly: true })).toEqual([
+      expect.objectContaining({
+        turnId: 'om_limited',
+        rateLimited: true,
+      }),
+    ]);
+    expect(q.peek()).toEqual([]);
+  });
+
+  it('records a structured retryable failure without treating its error text as an answer', () => {
+    const q = new BridgeTurnQueue();
+    q.mark('t1');
+    const srvErr: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'se1',
+      isApiErrorMessage: true,
+      error: 'server_error',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'API Error: 500 internal server error' }], stop_reason: 'stop_sequence' },
+    };
+    q.ingest([user('u1'), srvErr]);
+    const ready = q.drainEmittable({ explicitTerminalOnly: true });
+    expect(ready.length).toBe(1);
+    expect(ready[0].assistantUuids).toEqual([]);
+    expect(ready[0].terminalOutcome).toEqual({
+      status: 'failed',
+      errorCode: 'provider_server_error',
+      retryable: true,
+    });
+  });
+
+  it('preserves an unexpected EOF failure when turn_duration closes the boundary', () => {
+    const q = new BridgeTurnQueue();
+    q.mark('om_original');
+    const eof: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'fixture-error',
+      isApiErrorMessage: true,
+      error: 'unknown',
+      message: {
+        role: 'assistant',
+        stop_reason: 'stop_sequence',
+        content: [{ type: 'text', text: 'API Error: provider disconnected: unexpected EOF' }],
+      },
+    };
+    const duration: TranscriptEvent = {
+      type: 'system',
+      subtype: 'turn_duration',
+      uuid: 'fixture-duration',
+    };
+
+    q.ingest([user('u1'), eof, duration]);
+
+    expect(q.drainEmittable({ explicitTerminalOnly: true })).toEqual([
+      expect.objectContaining({
+        turnId: 'om_original',
+        assistantUuids: [],
+        terminalOutcome: {
+          status: 'failed',
+          errorCode: 'provider_unexpected_eof',
+          retryable: true,
+        },
+      }),
+    ]);
+  });
+
+  it('treats a bare turn_duration boundary as completed like next-turn-start', () => {
+    const q = new BridgeTurnQueue();
+    q.mark('om_boundary_only');
+    q.ingest([
+      user('u-boundary'),
+      { type: 'system', subtype: 'turn_duration', uuid: 'duration-only' },
+    ]);
+
+    expect(q.drainEmittable({ explicitTerminalOnly: true })).toEqual([
+      expect.objectContaining({
+        turnId: 'om_boundary_only',
+        terminalOutcome: { status: 'completed' },
+      }),
+    ]);
+  });
+
+  it('keeps visible text when stop_reason is null and turn_duration closes the turn', () => {
+    const q = new BridgeTurnQueue();
+    q.mark('om_null_reason');
+    q.ingest([
+      user('u-null-reason'),
+      {
+        type: 'assistant',
+        uuid: 'a-null-reason',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'Visible successful answer' }],
+          stop_reason: null,
+        },
+      },
+      {
+        type: 'system',
+        subtype: 'stop_hook_summary',
+        uuid: 'stop-hook-null-reason',
+        preventedContinuation: false,
+      } as TranscriptEvent,
+      { type: 'system', subtype: 'turn_duration', uuid: 'duration-null-reason' },
+    ]);
+
+    expect(q.drainEmittable({ explicitTerminalOnly: true })).toEqual([
+      expect.objectContaining({
+        turnId: 'om_null_reason',
+        assistantUuids: ['a-null-reason'],
+        terminalOutcome: { status: 'completed' },
+      }),
+    ]);
   });
 
   it('back-to-back Lark messages without idle: each turn keeps its own uuids', () => {
@@ -145,6 +295,49 @@ describe('BridgeTurnQueue', () => {
     const ready = q.drainEmittable();
     expect(ready.length).toBe(1);
     expect(ready[0].assistantUuids).toEqual(['a1']);
+  });
+
+  it('releases an empty turn only when the caller supplies a reliable terminal boundary', () => {
+    const q = new BridgeTurnQueue();
+    q.mark('delivery-key', undefined, 100, undefined, 3);
+    q.ingest([user('u-empty')]);
+
+    expect(q.drainEmittable()).toEqual([]);
+    expect(q.drainEmittable({ terminalBoundary: true })).toMatchObject([
+      { turnId: 'delivery-key', dispatchAttempt: 3, assistantUuids: [] },
+    ]);
+  });
+
+  it('does not let a stale submit-failure attempt delete a retry with the same turnId', () => {
+    const q = new BridgeTurnQueue();
+    q.mark('delivery-key', makeFingerprint('durable prompt'), 100, 'durable prompt', 1);
+    q.mark('delivery-key', makeFingerprint('durable prompt'), 200, 'durable prompt', 2);
+
+    expect(q.dropPendingTurn('delivery-key', 1)).toEqual(
+      expect.objectContaining({ turnId: 'delivery-key', dispatchAttempt: 1 }),
+    );
+    expect(q.peek()).toEqual([
+      expect.objectContaining({ turnId: 'delivery-key', dispatchAttempt: 2 }),
+    ]);
+
+    // A second callback from attempt 1 is stale. It must not fall back to
+    // turnId-only matching and retire the live retry mark.
+    expect(q.dropPendingTurn('delivery-key', 1)).toBeNull();
+    expect(q.peek()).toEqual([
+      expect.objectContaining({ turnId: 'delivery-key', dispatchAttempt: 2 }),
+    ]);
+
+    q.ingest([
+      user('u-retry', 'durable prompt'),
+      assistant('a-retry', 'retry answer'),
+    ]);
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({
+        turnId: 'delivery-key',
+        dispatchAttempt: 2,
+        assistantUuids: ['a-retry'],
+      }),
+    ]);
   });
 
   it('tool-result user events do not break collection for the current turn', () => {
@@ -828,4 +1021,138 @@ describe('BridgeTurnQueue', () => {
       ).toBe(true);
     });
   });
+
+  // Truncation-proof bind (codex PR #724): claude-code TRUNCATES the leading
+  // envelope lines (`<user_message>` + `<botmux_task …>`) when persisting the
+  // user turn, so the head-substring fingerprint never matches. We bind the
+  // pending durable mark ONLY when the recorded line is a PROVABLE truncation
+  // (its normalised text is a contiguous substring of the mark's full
+  // contentNormalized) — capability-agnostic, so an unrelated local terminal
+  // turn cannot steal the mark regardless of write-token access.
+  describe('isTruncatedMatch (content proof)', () => {
+    const full = makeFingerprintFull('<user_message> <botmux_task trusted="true"> Please run the migration and report results </botmux_task> </user_message>');
+    it('accepts the surviving tail of the marked content', () => {
+      expect(isTruncatedMatch('Please run the migration and report results </botmux_task> </user_message>', full)).toBe(true);
+    });
+    it('rejects unrelated short local input (pwd / ls)', () => {
+      expect(isTruncatedMatch('pwd', full)).toBe(false);
+      expect(isTruncatedMatch('ls -la', full)).toBe(false);
+    });
+    it('rejects when there is no mark content', () => {
+      expect(isTruncatedMatch('anything at all here', undefined)).toBe(false);
+      expect(isTruncatedMatch('anything at all here', '')).toBe(false);
+    });
+    it('rejects a too-short recorded line even if it is a substring', () => {
+      expect(isTruncatedMatch('run', full)).toBe(false); // below TRUNCATION_MATCH_MIN_CHARS
+    });
+    it('rejects text that is NOT a substring of the mark', () => {
+      expect(isTruncatedMatch('a completely different instruction entirely', full)).toBe(false);
+    });
+    // codex PR #724 review 4851322948 (P1): an INTERIOR ≥16-char substring must
+    // be false. A Web Terminal operator typing a command/phrase that appears in
+    // the MIDDLE of the marked task body is not the surviving truncation tail,
+    // so it must not prove belonging (the old `includes` accepted these and let
+    // the local turn steal the pending durable mark).
+    it('rejects an interior command substring (codex repro: run pnpm test --project unit)', () => {
+      const marked = makeFingerprintFull('<user_message> <botmux_task trusted="true"> Please investigate the failure; run pnpm test --project unit and report results </botmux_task> </user_message>');
+      // Both are ≥16-char substrings that appear INTERIOR to the mark, not as a
+      // suffix. The old `includes` accepted them (letting a local turn steal the
+      // durable mark); the `endsWith` anchor must reject both.
+      expect(isTruncatedMatch('run pnpm test --project unit', marked)).toBe(false);
+      expect(isTruncatedMatch('investigate the failure', marked)).toBe(false);
+      // Sanity: the genuine surviving tail (a real suffix, ≥16) still proves true.
+      expect(isTruncatedMatch('run pnpm test --project unit and report results </botmux_task> </user_message>', marked)).toBe(true);
+    });
+  });
+
+  describe('truncation-proof bind in the queue (durable mark, mismatched head)', () => {
+    it('binds the durable mark when the recorded line is a provable truncation of the marked content', () => {
+      const q = new BridgeTurnQueue();
+      const marked = '<user_message>\n<botmux_task trusted="true">\nDo the migration and report</botmux_task>\n</user_message>';
+      const fp = makeFingerprint(marked);
+      const norm = makeFingerprintFull(marked);
+      q.mark('t1', fp, 100, norm, 7); // durable trigger with contentNormalized
+      // claude persisted only the truncated tail (head envelope dropped):
+      q.ingest([user('u1', 'Do the migration and report</botmux_task>\n</user_message>'), assistant('a1', 'CC_DONE')]);
+      const ready = q.drainEmittable();
+      expect(ready).toHaveLength(1);
+      expect(ready[0].turnId).toBe('t1');
+      expect(ready[0].isLocal).toBeFalsy();
+      expect(ready[0].dispatchAttempt).toBe(7);
+      expect(ready[0].assistantUuids).toEqual(['a1']);
+    });
+
+    // codex PR #724 P1: a Web Terminal local turn (capability exists on ANY
+    // session, incl. apiOnly/core-only via write-link) must NOT steal the
+    // durable mark. The content proof makes this hold WITHOUT keying on session
+    // type — `pwd` is not a substring of the marked prompt.
+    it('does NOT let an unrelated Web Terminal local turn steal the durable mark', () => {
+      const q = new BridgeTurnQueue();
+      const marked = 'trusted API prompt: analyse the failing test and propose a fix';
+      const fp = makeFingerprint(marked);
+      const norm = makeFingerprintFull(marked);
+      q.mark('api-trigger', fp, 100, norm, 9);
+      // Human typed `pwd` in the Web Terminal while api-trigger was pending:
+      q.ingest([user('web-u', 'pwd'), assistant('web-a', '/tmp')]);
+      const apiMark = q.peek().find(t => t.turnId === 'api-trigger');
+      expect(apiMark?.started).toBe(false); // NOT stolen
+      const ready = q.drainEmittable();
+      expect(ready).toHaveLength(1);
+      expect(ready[0].isLocal).toBe(true);
+      expect(ready[0].turnId).not.toBe('api-trigger');
+      // The real API user line binds it afterwards.
+      q.ingest([user('api-u', 'trusted API prompt: analyse the failing test and propose a fix'), assistant('api-a', 'API reply')]);
+      const next = q.drainEmittable();
+      expect(next).toHaveLength(1);
+      expect(next[0].turnId).toBe('api-trigger');
+      expect(next[0].dispatchAttempt).toBe(9);
+      expect(next[0].assistantUuids).toEqual(['api-a']);
+    });
+
+    // codex PR #724 review 4851322948 (P1): the SHARP repro — an operator types
+    // a command that appears verbatim in the MIDDLE of the marked task body.
+    // Under the old `includes` this ≥16-char interior substring proved true and
+    // stole the pending durable mark. The `endsWith` anchor rejects it (not a
+    // suffix), so it synthesises a local turn and the durable mark survives to
+    // be bound by its real (truncated-tail) user line.
+    it('does NOT let an interior-command local turn steal the durable mark (endsWith anchor)', () => {
+      const q = new BridgeTurnQueue();
+      const marked = '<user_message>\n<botmux_task trusted="true">\nInvestigate the failure; run pnpm test --project unit and report results</botmux_task>\n</user_message>';
+      const fp = makeFingerprint(marked);
+      const norm = makeFingerprintFull(marked);
+      q.mark('api-trigger', fp, 100, norm, 11);
+      // Operator types the exact command that lives INTERIOR to the marked body:
+      q.ingest([user('web-u', 'run pnpm test --project unit'), assistant('web-a', 'FAIL: 2 tests')]);
+      const apiMark = q.peek().find(t => t.turnId === 'api-trigger');
+      expect(apiMark?.started).toBe(false); // interior substring must NOT steal
+      const ready = q.drainEmittable();
+      expect(ready).toHaveLength(1);
+      expect(ready[0].isLocal).toBe(true);
+      expect(ready[0].turnId).not.toBe('api-trigger');
+      // The real durable turn's truncated tail (a genuine suffix) binds it after.
+      q.ingest([user('api-u', 'run pnpm test --project unit and report results</botmux_task>\n</user_message>'), assistant('api-a', 'API reply')]);
+      const next = q.drainEmittable();
+      expect(next).toHaveLength(1);
+      expect(next[0].turnId).toBe('api-trigger');
+      expect(next[0].dispatchAttempt).toBe(11);
+      expect(next[0].assistantUuids).toEqual(['api-a']);
+    });
+
+    it('no truncation proof + no fingerprint match → synth local (not silently dropped)', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('t1', makeFingerprint('some API prompt'), 100, makeFingerprintFull('some API prompt'));
+      q.ingest([user('web-u', 'unrelated local command output here'), assistant('web-a', 'result')]);
+      const ready = q.drainEmittable();
+      expect(ready).toHaveLength(1);
+      expect(ready[0].isLocal).toBe(true); // emitted, not dropped
+      const t1 = q.peek().find(t => t.turnId === 't1');
+      expect(t1?.started).toBe(false); // mark untouched
+    });
+  });
 });
+
+/** Local helper: full normalised content (what the worker stores as
+ *  contentNormalized), distinct from the 30-char makeFingerprint. */
+function makeFingerprintFull(message: string): string {
+  return message.replace(/\s+/g, ' ').trim();
+}

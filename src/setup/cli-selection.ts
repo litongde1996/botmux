@@ -62,7 +62,7 @@ const AIDEN_VARIANTS: ReadonlyArray<CliSelectOption> = [AIDEN_NATIVE, AIDEN_X_CL
 // ─── Mira 选项 ───────────────────────────────────────────────────────────────
 // Mira 有两种形态（都是原生 cliId，无 wrapperCli），合并成一个「Mira」二级菜单：
 //   - Mira App  → cliId `mira`：直连 Mira Web API（云端编排 + 远程沙盒，聊天/搜索）
-//   - Mir CLI   → cliId `mir` ：本地 `mircli -p --lean`（在用户机器上执行、操作工作区）
+//   - Mir CLI   → cliId `mir` ：本地 `mircli -p`（在用户机器上执行、操作工作区）
 const MIRA_APP: CliSelectOption = { key: 'mira', label: 'Mira App（Web API）', cliId: 'mira' };
 const MIRA_CLI: CliSelectOption = { key: 'mir', label: 'Mir CLI（本地 mircli）', cliId: 'mir' };
 
@@ -83,6 +83,15 @@ const CODEX_VARIANTS: ReadonlyArray<CliSelectOption> = [CODEX_NATIVE, CODEX_APP]
 const TRAE_COCO: CliSelectOption = { key: 'coco', label: 'TRAE CLI（CoCo）', cliId: 'coco' };
 const TRAE_X: CliSelectOption = { key: 'traex', label: 'traex', cliId: 'traex' };
 const TRAE_VARIANTS: ReadonlyArray<CliSelectOption> = [TRAE_COCO, TRAE_X];
+
+// ─── OpenCode 选项 ──────────────────────────────────────────────────────────
+// OpenCode 与 OpenCode 2 合并成一个「OpenCode」二级菜单（都是原生 cliId，无
+// wrapperCli）：
+//   - OpenCode     → cliId `opencode`  ：OpenCode 1.x
+//   - OpenCode 2   → cliId `opencode2` ：OpenCode 2.0（beta，二进制 opencode2）
+const OPENCODE_NATIVE: CliSelectOption = { key: 'opencode', label: 'OpenCode', cliId: 'opencode' };
+const OPENCODE2_OPTION: CliSelectOption = { key: 'opencode2', label: 'OpenCode 2（beta）', cliId: 'opencode2' };
+const OPENCODE_VARIANTS: ReadonlyArray<CliSelectOption> = [OPENCODE_NATIVE, OPENCODE2_OPTION];
 
 // ─── Pi 选项 ─────────────────────────────────────────────────────────────────
 // Pi 与 Oh My Pi 不合并，但在菜单里相邻摆放（在 Pi 的位置成对发出）。
@@ -169,6 +178,9 @@ export const CLI_SELECT_TREE: ReadonlyArray<CliSelectGroup> = [
       { key: 'oh-my-pi', label: 'Oh My Pi', option: OHMYPI_OPTION },
     ];
     if (o.id === 'oh-my-pi') return [];
+    // opencode + opencode2 collapse into one「OpenCode」二级菜单 at opencode's position.
+    if (o.id === 'opencode') return [{ key: 'opencode', label: 'OpenCode', children: OPENCODE_VARIANTS }];
+    if (o.id === 'opencode2') return [];
     return [{ key: o.id, label: o.label, option: { key: o.id, label: o.label, cliId: o.id } }];
   }),
   ...EXTRA_GATEWAY_GROUPS,
@@ -189,6 +201,8 @@ export const CLI_SELECT_OPTIONS: ReadonlyArray<CliSelectOption> = [
     if (o.id === 'traex') return [];
     if (o.id === 'pi') return [PI_OPTION, OHMYPI_OPTION];  // Pi + Oh My Pi adjacent
     if (o.id === 'oh-my-pi') return [];
+    if (o.id === 'opencode') return OPENCODE_VARIANTS;    // expands to OpenCode + OpenCode 2
+    if (o.id === 'opencode2') return [];
     return [{ key: o.id, label: o.label, cliId: o.id }];
   }),
   ...CJADK_VARIANTS,
@@ -235,7 +249,9 @@ export function parseWrapperCli(wrapperCli: string): string[] {
 
 /** wrapper 前缀首 token 是否为 aiden 网关（`aiden x <cli>`）。aiden 会拦截底层 CLI
  *  的 config 透传参数——`aiden x claude` 拒收 `--settings`、`aiden x codex` 自 1.8.38
- *  起直接报错拒收 `-c`——故转发前要剥掉 botmux 注入的那部分（见 {@link stripWrapperUnsafeArgs}）。 */
+ *  起直接报错拒收 `-c`；此外 aiden 自身已注入 codex 的 `--dangerously-bypass-hook-trust`，
+ *  botmux 再透传一份会让 codex 收到两次而报错——故转发前要剥掉这几项 botmux 注入的参数
+ *  （见 {@link stripWrapperUnsafeArgs}）。 */
 function isAidenWrapper(tokens: ReadonlyArray<string>): boolean {
   return tokens[0] === 'aiden';
 }
@@ -249,11 +265,13 @@ function isCjadkWrapper(tokens: ReadonlyArray<string>): boolean {
   return tokens[0] === 'cjadk';
 }
 
-/** 是否为 botmux 经 codex `-c` 注入的「把 BOTMUX_* 塞进 shell 工具环境」配置覆盖值。
- *  只认 botmux 自己注入的 `shell_environment_policy.set.BOTMUX_` 前缀，绝不误伤用户
- *  自带的 `-c key=val`。 */
-function isBotmuxShellEnvConfigValue(value: string | undefined): boolean {
-  return !!value && value.startsWith('shell_environment_policy.set.BOTMUX_');
+/** 是否为 botmux 自己给 Codex 注入的 config 覆盖。精确白名单避免误伤用户自带的
+ * `-c key=val`；wrapper 层据此决定剥离（aiden）或改成长参数（cjadk）。 */
+function isBotmuxCodexConfigValue(value: string | undefined): boolean {
+  return !!value && (
+    value.startsWith('shell_environment_policy.set.BOTMUX_')
+    || value === 'check_for_update_on_startup=false'
+  );
 }
 
 /**
@@ -274,18 +292,25 @@ export function stripSettingsArgs(args: ReadonlyArray<string>): string[] {
 /**
  * 剥掉 aiden `aiden x <cli>` 网关拒收的、**botmux 注入的**底层 CLI config 覆盖参数：
  *   - `--settings <v>` / `--settings=<v>`（claude 携带 hook/bypass，aiden x claude 历来就剥）
- *   - `-c shell_environment_policy.set.BOTMUX_*=…`（codex 用来把 BOTMUX_SESSION_ID 注入
- *     shell 工具环境；aiden 1.8.38+ 直接报错拒收 `aiden x codex` 透传的 `-c`，正是本次回归）
+ *   - botmux 自己注入的 Codex `-c`（session 环境，以及关闭启动更新选择器）；
+ *     aiden 1.8.38+ 会直接报错拒收 `aiden x codex` 透传的 `-c`/`--config`。
+ *   - `--dangerously-bypass-hook-trust`（codex 家族的 hook-trust 绕过 flag）：aiden 网关
+ *     自身已管理底层 codex 的 hook-trust，botmux 再透传一份会让 codex 收到两次 →
+ *     `error: the argument '--dangerously-bypass-hook-trust' cannot be used multiple times`
+ *     直接启动失败。故经 aiden 网关时一律剥掉这份冗余副本（bare flag，无值）；aiden x claude
+ *     路径底层 claude 从不注入此 flag，剥除是 no-op。
  * 这些参数承载的 session 环境已在进程级 env（BOTMUX_SESSION_ID 等）注入、并被 wrapper
  * 子进程继承（见 worker.ts childEnv），故剥掉只是去掉一条冗余的 belt-and-suspenders
- * 通道，不丢功能。`-c` 按 botmux 注入特征精确识别——只剥值以 `shell_environment_policy.set.BOTMUX_`
- * 开头者，用户自带的 `-c key=val` 一律不动；`--settings` 则沿用 aiden x claude 历来的兼容策略
+ * 通道，不丢功能。关闭启动更新的覆盖在 aiden 路径无法传递（launcher 本身禁止 config）；
+ * worker 会在极少数仍出现选择器的启动中自动选择非升级项，host 侧仍会做每日只读检查。
+ * `-c` 按 botmux 注入白名单精确识别，用户自带的
+ * `-c key=val` 一律不动；`--settings` 则沿用 aiden x claude 历来的兼容策略
  * 整体剥离（复用 {@link stripSettingsArgs}，不区分来源）。原生启动及 ttadk 等「裸透传」网关
  * 不走本函数，仍保留 `-c`（它们的 launcher 接受并转发给真 CLI，照常生效）。cjadk 走单独的
  * {@link rewriteCjadkCodexConfigArgs}（它的 `code` 子命令把 `-c` 占为 `--command`，要改写成
  * `--config` 才能透传，而非剥离——故不复用本函数）。
  *
- * 关键：识别按 botmux 注入特征（`--settings` 的语义 + `-c …BOTMUX_` 前缀）而非按某个具体 CLI——
+ * 关键：识别按 botmux 注入特征（`--settings` 的语义 + Codex config 白名单）而非按某个具体 CLI——
  * 任何适配器将来注入**同形态**的 config 覆盖，经 aiden 网关时都会被一并剥掉，不会重蹈 codex 覆辙。
  * 注意范围仅限上述两种 botmux 注入形态：coco 的 `--config model.name=…`（承载 model、非 session
  * 管线，且无内置 `aiden x coco` 选项）等不同形态的 config 覆盖**有意不在此剥离**。
@@ -296,15 +321,18 @@ export function stripWrapperUnsafeArgs(args: ReadonlyArray<string>): string[] {
   const out: string[] = [];
   for (let i = 0; i < afterSettings.length; i++) {
     const a = afterSettings[i]!;
-    if (a === '-c' && isBotmuxShellEnvConfigValue(afterSettings[i + 1])) { i++; continue; }
+    if (a === '-c' && isBotmuxCodexConfigValue(afterSettings[i + 1])) { i++; continue; }
+    // aiden 网关自身已管理底层 codex 的 hook-trust；再透传 botmux 注入的这份
+    // 会让 codex 收到两次 → clap 报 "cannot be used multiple times" 启动失败。
+    if (a === '--dangerously-bypass-hook-trust') continue;
     out.push(a);
   }
   return out;
 }
 
 /**
- * cjadk codex 专用改写：把 botmux 给 codex 注入的 `-c shell_environment_policy.set.BOTMUX_*=…`
- * 改写成 codex 的长形式 `--config shell_environment_policy.set.BOTMUX_*=…`。
+ * cjadk codex 专用改写：把 botmux 给 codex 注入的 `-c <config>` 改写成 Codex 的
+ * 长形式 `--config <config>`。
  *
  * 起因：cjadk 的 `code` 子命令用 commander 定义了 `-c, --command <cmd>`（"运行自定义命令而非默认
  * agent 命令"），即便 `allowUnknownOption(true)`，**已定义**的 `-c` 仍被 cjadk 自己吃掉绑到
@@ -316,15 +344,15 @@ export function stripWrapperUnsafeArgs(args: ReadonlyArray<string>): string[] {
  * `--config`，故 `--config …` 落入 cjadk 的 passthrough（`allowUnknownOption`）原样转发给真 codex，效果与 `-c`
  * 完全一致。相比 aiden 路径的整条剥离，改写**保留**了把 BOTMUX_SESSION_ID 注入 codex shell 工具环境的通道。
  *
- * 只改写 botmux 自己注入的那一处（值以 `shell_environment_policy.set.BOTMUX_` 开头），用户自带的 `-c key=val`
- * 一律不动。非 codex 的 cjadk 形态（cjadk claude 带 `--settings`、不带 `-c BOTMUX`）经此函数是 no-op，
+ * 只改写 botmux 自己注入的 config 白名单，用户自带的 `-c key=val` 一律不动。
+ * 非 codex 的 cjadk 形态（cjadk claude 带 `--settings`、不带这些值）经此函数是 no-op，
  * `--settings` 照常保留透传。
  */
 export function rewriteCjadkCodexConfigArgs(args: ReadonlyArray<string>): string[] {
   const out: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
-    if (a === '-c' && isBotmuxShellEnvConfigValue(args[i + 1])) {
+    if (a === '-c' && isBotmuxCodexConfigValue(args[i + 1])) {
       out.push('--config', args[i + 1]!);
       i++;
       continue;
@@ -408,6 +436,19 @@ export function ttadkConfigModelChoices(wrapperCli: string | undefined): string[
  *   - ttadk 网关走专门分支注入 `-m <model> --skip-check`（见 {@link buildTtadkLaunch}）
  * 前缀为空时返回 `{ bin: '', args }`，调用方据此跳过（不改写 spawn）。
  */
+/**
+ * Wrapper-specific launch ENVIRONMENT — the single source of truth shared by
+ * the worker spawn branch and one-shot child processes (session-group AI
+ * titling). cjadk launches its agent inside an interactive wrapper (startup
+ * selector + terminal quirks) unless CJADK_INTERACTIVE=0; without it a
+ * non-TTY one-shot call can hang on the selector.
+ */
+export function wrapperLaunchEnv(wrapperCli: string | undefined): Record<string, string> | undefined {
+  if (!wrapperCli?.trim()) return undefined;
+  if (parseWrapperCli(wrapperCli)[0] === 'cjadk') return { CJADK_INTERACTIVE: '0' };
+  return undefined;
+}
+
 export function buildWrappedLaunch(
   wrapperCli: string,
   cliArgs: ReadonlyArray<string>,

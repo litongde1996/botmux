@@ -5,20 +5,21 @@
  * choosing `creatorLarkAppId`, resolving bot refs, deriving user_open_ids, etc.
  * This service only orchestrates the Lark API sequence:
  *
- *   1. createChat (bots + invited users)
- *   2. transferChatOwner (best-effort, skipped if invitee was rejected)
- *   3. send @-mention notify (best-effort, skipped if invitee was rejected)
+ *   1. createChat (creator + invited users), then synchronously announce chatId
+ *   2. add peer bots / owners and fetch the share link
+ *   3. transferChatOwner + notify + bindings/bootstrap (best-effort where noted)
  *
- * Partial failures (transfer/notify) are returned as `*Error` fields without
- * throwing — the chat already exists at that point and retrying would create
- * duplicate groups. Only createChat throwing surfaces as an exception.
+ * The progress hook is the durable side-effect boundary: once it fires, the
+ * chat exists and retrying would create a duplicate even if a later API call
+ * throws or stalls. Transfer/notify failures are returned as `*Error` fields.
  *
  * Lark open_id is app-scoped: `userOpenIds`, `transferOwnerTo`, and
- * `notifyOwnerOpenId` MUST be in `creatorLarkAppId`'s app scope. Enforcing
- * this is the decision layer's job — the service trusts its inputs.
+ * `notifyOwnerOpenId` MUST be in `creatorLarkAppId`'s app scope. The team-group
+ * path may instead provide `transferOwnerUnionId`; this service resolves that
+ * tenant-stable ID into the creator app's open_id before transfer.
  */
 import { createChat, transferChatOwner, getChatOwner, getChatShareLink, addUsersToChatByUnionId, addBotToChat } from './groups-store.js';
-import { listChatBotMembers, sendMessage } from '../im/lark/client.js';
+import { listChatBotMembers, resolveAllowedUsersWithMap, sendMessage } from '../im/lark/client.js';
 import { bindOncall } from './oncall-store.js';
 import { isValidRoleProfileId, readRoleProfileEntry } from './role-profile-store.js';
 import { writeRoleFile } from '../core/role-resolver.js';
@@ -35,6 +36,9 @@ export interface CreateGroupOpts {
    *  federated group regardless of which bot they paired through (open_id is
    *  app-scoped, union_id is not). Added after the chat is created. */
   ownerUnionIds?: string[];
+  /** Tenant-stable owner target for federated/team groups. Resolved to an
+   *  app-scoped open_id after the owner has been added to the chat. */
+  transferOwnerUnionId?: string;
   transferOwnerTo?: string;
   notifyOwnerOpenId?: string;
   /** Optional working directory to bind the newly created chat to oncall for
@@ -45,6 +49,27 @@ export interface CreateGroupOpts {
    *  local entry directly; peer bots are prompted by a multi-mention
    *  `/role profile apply` command in the newly created chat. */
   roleProfileId?: string;
+  /** Optional kickoff: after the chat is created, the creator @-mentions this
+   *  bot and posts `kickoffPrompt` as a top-level message. Used to
+   *  auto-trigger a bot (e.g. a reviewer) in the new group without a human
+   *  having to @ it. The kickoff bot must be present in `larkAppIds`. */
+  kickoffBotLarkAppId?: string;
+  kickoffPrompt?: string;
+  /** Authorization-grade preflight run after peer invitations settle and
+   * before any role/kickoff bot message. CLI cold-group creation uses this to
+   * establish the exact talk-only grant matrix; rejection aborts initialization
+   * while preserving the already-announced chatId for controlled recovery. */
+  ensureBotCollaboration?: (
+    chatId: string,
+    joinedBotAppIds: string[],
+    rejectedBotAppIds: string[],
+  ) => Promise<void>;
+  /** Synchronous progress hook fired immediately after chat.create returns a
+   *  chatId, before bot invites, share-link lookup, owner transfer, oncall
+   *  binding, or role bootstrap. CLI callers use this as the durable
+   *  side-effect boundary: once notified, retrying create would duplicate the
+   *  group even if a later best-effort step hangs or fails. */
+  onChatCreated?: (chatId: string) => void;
 }
 
 export interface CreateGroupResult {
@@ -66,6 +91,43 @@ export interface CreateGroupResult {
   oncallBindings: { larkAppId: string; ok: boolean; created?: boolean; error?: string }[];
   roleProfileBootstrapMessageId: string | null;
   roleProfileBootstrapError: string | null;
+  kickoffMessageId: string | null;
+  kickoffError: string | null;
+}
+
+export interface TransferGroupOwnerOpts {
+  creatorLarkAppId: string;
+  chatId: string;
+  ownerId: string;
+  ownerIdType?: 'open_id' | 'union_id';
+}
+
+export interface TransferGroupOwnerResult {
+  ownerTransferredTo: string | null;
+  transferError: string | null;
+}
+
+/**
+ * Best-effort ownership transfer for an already-created group. Federation uses
+ * this after an out-of-scope operator has been added by their own deployment;
+ * accepting union_id avoids leaking an app-scoped open_id back to the creator.
+ */
+export async function transferGroupOwner(opts: TransferGroupOwnerOpts): Promise<TransferGroupOwnerResult> {
+  const ownerId = opts.ownerId.trim();
+  if (!ownerId) return { ownerTransferredTo: null, transferError: 'owner_id_required' };
+  const ownerIdType = opts.ownerIdType ?? 'open_id';
+  const tr = ownerIdType === 'open_id'
+    ? await transferChatOwner(opts.creatorLarkAppId, opts.chatId, ownerId)
+    : await transferChatOwner(opts.creatorLarkAppId, opts.chatId, ownerId, ownerIdType);
+  if (tr.ok) return { ownerTransferredTo: ownerId, transferError: null };
+
+  // A timed-out update may still have committed. Read back using the SAME ID
+  // type as the request so union_id retries remain app-scope independent.
+  const currentOwner = ownerIdType === 'open_id'
+    ? await getChatOwner(opts.creatorLarkAppId, opts.chatId)
+    : await getChatOwner(opts.creatorLarkAppId, opts.chatId, ownerIdType);
+  if (currentOwner === ownerId) return { ownerTransferredTo: ownerId, transferError: null };
+  return { ownerTransferredTo: null, transferError: tr.error };
 }
 
 export async function createGroupWithBots(opts: CreateGroupOpts): Promise<CreateGroupResult> {
@@ -82,6 +144,7 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     botIds: [],
     userIds: opts.userOpenIds ?? [],
   });
+  opts.onChatCreated?.(r.chatId);
   for (let i = 0; i < otherBots.length; i += BOT_BATCH) {
     const batch = otherBots.slice(i, i + BOT_BATCH);
     let added = await addBotToChat(opts.creatorLarkAppId, r.chatId, batch);
@@ -90,6 +153,18 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
       for (const id of batch) added.push(...await addBotToChat(opts.creatorLarkAppId, r.chatId, [id]));
     }
     for (const a of added) if (!a.ok) r.invalidBotIds.push(a.id);
+  }
+
+  const invalidBots = new Set(r.invalidBotIds);
+  const joinedBotIds = Array.from(new Set([opts.creatorLarkAppId, ...opts.larkAppIds]))
+    .filter(id => !invalidBots.has(id));
+  if (opts.ensureBotCollaboration) {
+    // Strict ordering boundary: invitations must have committed before the
+    // receiver-scoped live membership probes can succeed, while role/kickoff
+    // messages must not be emitted until the exact requested membership and
+    // grant matrix are ready. The callback also sees rejected invitees so a
+    // CLI caller cannot report a partially-created group as complete.
+    await opts.ensureBotCollaboration(r.chatId, joinedBotIds, [...invalidBots]);
   }
 
   // Fetch the shareable join link BEFORE transferring ownership: the creator bot
@@ -114,44 +189,53 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     invalidOwnerUnionIds = ar.invalidUserIds;
   }
 
-  let ownerTransferredTo: string | null = null;
+  let transferOwnerTo = opts.transferOwnerTo?.trim() || null;
+  const transferOwnerUnionId = opts.transferOwnerUnionId?.trim() || null;
   let transferError: string | null = null;
-  if (opts.transferOwnerTo) {
-    // Skip transfer if Feishu rejected the invite — transferring to a
-    // non-member returns "user not in chat" anyway.
-    if (r.invalidUserIds.includes(opts.transferOwnerTo)) {
+  if (!transferOwnerTo && transferOwnerUnionId) {
+    if (invalidOwnerUnionIds.includes(transferOwnerUnionId)) {
       transferError = 'invitee_rejected';
     } else {
-      const tr = await transferChatOwner(opts.creatorLarkAppId, r.chatId, opts.transferOwnerTo);
-      if (tr.ok) {
-        ownerTransferredTo = opts.transferOwnerTo;
-      } else {
-        // Lark occasionally ACKs the owner transfer slowly (504 Gateway Timeout
-        // or transient network error) even though the write actually committed
-        // server-side. Verify by reading back the current owner before
-        // surfacing the error — if the chat is already owned by the target,
-        // the transfer really did succeed and the warning would mislead.
-        const currentOwner = await getChatOwner(opts.creatorLarkAppId, r.chatId);
-        if (currentOwner === opts.transferOwnerTo) {
-          ownerTransferredTo = opts.transferOwnerTo;
-        } else {
-          transferError = tr.error;
-        }
+      try {
+        const resolved = await resolveAllowedUsersWithMap(opts.creatorLarkAppId, [transferOwnerUnionId]);
+        transferOwnerTo = resolved.map.get(transferOwnerUnionId) ?? null;
+        if (!transferOwnerTo) transferError = 'owner_union_id_unresolved';
+      } catch {
+        transferError = 'owner_union_id_unresolved';
       }
     }
   }
 
+  let ownerTransferredTo: string | null = null;
+  if (transferOwnerTo && !transferError) {
+    // Skip transfer if Feishu rejected the invite — transferring to a
+    // non-member returns "user not in chat" anyway.
+    if (r.invalidUserIds.includes(transferOwnerTo)) {
+      transferError = 'invitee_rejected';
+    } else {
+      const transferred = await transferGroupOwner({
+        creatorLarkAppId: opts.creatorLarkAppId,
+        chatId: r.chatId,
+        ownerId: transferOwnerTo,
+      });
+      ownerTransferredTo = transferred.ownerTransferredTo;
+      transferError = transferred.transferError;
+    }
+  }
+
+  const notifyOwnerOpenId = opts.notifyOwnerOpenId?.trim()
+    || (transferOwnerUnionId ? transferOwnerTo : null);
   let notifyMessageId: string | null = null;
-  let notifyError: string | null = null;
-  if (opts.notifyOwnerOpenId) {
-    if (r.invalidUserIds.includes(opts.notifyOwnerOpenId)) {
+  let notifyError: string | null = !notifyOwnerOpenId && transferOwnerUnionId ? transferError : null;
+  if (notifyOwnerOpenId) {
+    if (r.invalidUserIds.includes(notifyOwnerOpenId)) {
       notifyError = 'invitee_rejected';
     } else {
       try {
         notifyMessageId = await sendMessage(
           opts.creatorLarkAppId,
           r.chatId,
-          `<at user_id="${opts.notifyOwnerOpenId}"></at>`,
+          `<at user_id="${notifyOwnerOpenId}"></at>`,
           'text',
         );
       } catch (e: any) {
@@ -161,9 +245,6 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
   }
 
   const oncallBindings: CreateGroupResult['oncallBindings'] = [];
-  const invalidBots = new Set(r.invalidBotIds);
-  const joinedBotIds = Array.from(new Set([opts.creatorLarkAppId, ...opts.larkAppIds]))
-    .filter(id => !invalidBots.has(id));
   const bindWorkingDir = opts.bindWorkingDir?.trim();
   if (bindWorkingDir) {
     // Bind the new chat for every bot that actually joined it. The creator is
@@ -228,6 +309,47 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     }
   }
 
+  // Kickoff: creator @-mentions a target bot with a prompt so it auto-starts
+  // working (e.g. a PR review). Resolve the @ handle from the creator's view of
+  // the new chat: Lark open_id values are app-scoped, so the target bot's
+  // self-reported open_id cannot be used directly by the creator app.
+  let kickoffMessageId: string | null = null;
+  let kickoffError: string | null = null;
+  const kickoffBot = opts.kickoffBotLarkAppId?.trim();
+  const kickoffPrompt = opts.kickoffPrompt?.trim();
+  if (!!kickoffBot !== !!kickoffPrompt) {
+    kickoffError = 'kickoff_args_must_be_paired';
+  } else if (kickoffBot && kickoffPrompt) {
+    if (kickoffBot === opts.creatorLarkAppId) {
+      kickoffError = 'creator_cannot_kickoff_self';
+    } else if (!opts.larkAppIds.includes(kickoffBot)) {
+      kickoffError = 'kickoff_bot_not_selected';
+    } else if (r.invalidBotIds.includes(kickoffBot)) {
+      kickoffError = 'invitee_rejected';
+    }
+
+    try {
+      if (!kickoffError) {
+        const members = await listChatBotMembers(opts.creatorLarkAppId, r.chatId);
+        const target = members.find(member => member.larkAppId === kickoffBot);
+        if (!target) {
+          kickoffError = 'kickoff_bot_not_found_in_chat';
+        } else if (!target.mentionable) {
+          kickoffError = 'kickoff_bot_not_mentionable';
+        } else {
+          kickoffMessageId = await sendMessage(
+            opts.creatorLarkAppId,
+            r.chatId,
+            `<at user_id="${target.openId}"></at> ${kickoffPrompt}`,
+            'text',
+          );
+        }
+      }
+    } catch (e: any) {
+      kickoffError = e?.message ?? String(e);
+    }
+  }
+
   return {
     ok: true,
     chatId: r.chatId,
@@ -244,5 +366,7 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     oncallBindings,
     roleProfileBootstrapMessageId,
     roleProfileBootstrapError,
+    kickoffMessageId,
+    kickoffError,
   };
 }

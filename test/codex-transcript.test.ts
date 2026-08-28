@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, appendFileSync, rmSync, statSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, splitCodexEventsByCutoff, extractLastCodexTurn, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
+import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_RATE_LIMIT_ERROR_CODE, CODEX_TASK_FAILED_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, codexTaskFailureCode, drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, codexHistorySidIsOwned, isCodexRateLimitEvent, splitCodexEventsByCutoff, extractLastCodexTurn, scanCodexThreadSettings, readLatestCodexRuntime, codexCotEntriesFromResponseItem, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
 
 let dir: string;
 let path: string;
@@ -24,13 +24,32 @@ function userResponseItem(text: string, ts = '2026-04-29T07:00:00.000Z') {
 }
 
 function assistantFinalResponseItem(text: string, ts = '2026-04-29T07:00:01.000Z') {
+  // The turn terminal is now event_msg/task_complete, NOT the assistant
+  // response_item. Codex >=0.146 dropped phase:'final_answer', so this helper
+  // emits the task_complete record that actually closes the turn. `text`
+  // becomes last_agent_message. Kept named "assistantFinal…" so existing
+  // call sites read naturally.
+  return {
+    timestamp: ts,
+    type: 'event_msg',
+    payload: {
+      type: 'task_complete',
+      turn_id: `turn-${ts}`,
+      last_agent_message: text,
+    },
+  };
+}
+
+/** An assistant `response_item` message — mid-turn OR final, both phase-less in
+ *  codex >=0.146. The reader must NOT treat any of these as a turn boundary. */
+function assistantMessageResponseItem(text: string, phase?: string, ts = '2026-04-29T07:00:01.000Z') {
   return {
     timestamp: ts,
     type: 'response_item',
     payload: {
       type: 'message',
       role: 'assistant',
-      phase: 'final_answer',
+      ...(phase !== undefined ? { phase } : {}),
       content: [{ type: 'output_text', text }],
     },
   };
@@ -80,6 +99,42 @@ describe('findCodexRolloutBySessionId', () => {
       else process.env.CODEX_HOME = prevCodexHome;
       rmSync(codexHome, { recursive: true, force: true });
     }
+  });
+});
+
+describe('codexHistorySidIsOwned (pure attach-ownership decision)', () => {
+  // This is the exact predicate BOTH worker attach entry points (notify
+  // re-attach + initial-attach guard) consult via codexHistorySidOwnedByCurrentPid.
+  // Testing it directly proves "owned B is selected, foreign A is rejected"
+  // without a live worker — and without a parallel copy of the decision.
+  const OWNED = 'aaaaaaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa';
+  const SIBLING = 'bbbbbbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb';
+  const FOREIGN = 'cccccccc-cccc-7ccc-8ccc-cccccccccccc';
+
+  it('accepts an owned sid (single-rollout pid)', () => {
+    expect(codexHistorySidIsOwned(OWNED, new Set([OWNED]))).toBe(true);
+  });
+
+  it('accepts EITHER owned sid in the parent+sibling multi-rollout case', () => {
+    const owned = new Set([OWNED, SIBLING]);
+    expect(codexHistorySidIsOwned(OWNED, owned)).toBe(true);
+    expect(codexHistorySidIsOwned(SIBLING, owned)).toBe(true);
+  });
+
+  it('rejects a foreign sid (shared-CODEX_HOME sibling pane collision)', () => {
+    expect(codexHistorySidIsOwned(FOREIGN, new Set([OWNED, SIBLING]))).toBe(false);
+  });
+
+  it('is case-insensitive on the sid', () => {
+    expect(codexHistorySidIsOwned(OWNED.toUpperCase(), new Set([OWNED]))).toBe(true);
+  });
+
+  it('fails closed when the owned set is unavailable (fd enumeration failed)', () => {
+    expect(codexHistorySidIsOwned(OWNED, undefined)).toBe(false);
+  });
+
+  it('fails closed against an empty owned set (pid holds no rollout yet)', () => {
+    expect(codexHistorySidIsOwned(OWNED, new Set())).toBe(false);
   });
 });
 
@@ -217,6 +272,40 @@ describe('extractLastCodexTurn', () => {
   });
 });
 
+describe('codexTaskFailureCode (shared Codex-family failure classifier)', () => {
+  it('classifies model gateway / upstream failures as codex_upstream_error', () => {
+    // Live incident shape: the model gateway cancelled the stream mid-turn.
+    expect(codexTaskFailureCode(
+      'upstream stream error: rpc error: code = 1 desc = Cancelled by backend [biz error]',
+    )).toBe(CODEX_UPSTREAM_ERROR_CODE);
+    expect(codexTaskFailureCode('502 Bad Gateway')).toBe(CODEX_UPSTREAM_ERROR_CODE);
+    expect(codexTaskFailureCode('503 Service Unavailable')).toBe(CODEX_UPSTREAM_ERROR_CODE);
+    expect(codexTaskFailureCode({ error: { message: 'Internal server error' } }))
+      .toBe(CODEX_UPSTREAM_ERROR_CODE);
+    expect(codexTaskFailureCode('Overloaded: please retry')).toBe(CODEX_UPSTREAM_ERROR_CODE);
+  });
+
+  it('checks upstream BEFORE connection so "gateway timeout" is server-side, not local network', () => {
+    expect(codexTaskFailureCode('504 Gateway Timeout')).toBe(CODEX_UPSTREAM_ERROR_CODE);
+  });
+
+  it('keeps the more specific categories ahead of upstream', () => {
+    // A gateway 429 is still a rate limit; a gateway 401 is still auth.
+    expect(codexTaskFailureCode('upstream error: 429 Too Many Requests')).toBe(CODEX_RATE_LIMIT_ERROR_CODE);
+    expect(codexTaskFailureCode('gateway rejected: 401 Unauthorized')).toBe(CODEX_AUTH_ERROR_CODE);
+    expect(codexTaskFailureCode('invalid_request: empty_string')).toBe(CODEX_INVALID_REQUEST_ERROR_CODE);
+  });
+
+  it('keeps plain connectivity failures on codex_connection_failed', () => {
+    expect(codexTaskFailureCode('ECONNRESET: connection reset by peer')).toBe(CODEX_CONNECTION_ERROR_CODE);
+    expect(codexTaskFailureCode('getaddrinfo ENOTFOUND api.example.com')).toBe(CODEX_CONNECTION_ERROR_CODE);
+  });
+
+  it('falls back to codex_task_failed for unrecognized errors', () => {
+    expect(codexTaskFailureCode('something exploded')).toBe(CODEX_TASK_FAILED_ERROR_CODE);
+  });
+});
+
 describe('drainCodexRollout', () => {
   it('returns empty for missing file', () => {
     const r = drainCodexRollout(join(dir, 'missing.jsonl'), 0);
@@ -224,7 +313,7 @@ describe('drainCodexRollout', () => {
     expect(r.newOffset).toBe(0);
   });
 
-  it('extracts user + assistant_final from response_item', () => {
+  it('extracts user (response_item) + assistant_final (task_complete)', () => {
     writeFileSync(path,
       ev(userResponseItem('hello there')) +
       ev(assistantFinalResponseItem('hi back')));
@@ -249,35 +338,401 @@ describe('drainCodexRollout', () => {
     expect(r.events[0].text).toBe('real user prompt');
   });
 
-  it('skips assistant phase=commentary (mid-turn status)', () => {
+  // Regression for the codex >=0.146 phase-drift bug: mid-turn AND final
+  // assistant response_item messages are both phase-less and must NOT be a
+  // turn boundary. Only task_complete closes the turn. Keying on a phase-less
+  // assistant message would close the turn on the first mid-turn preamble
+  // ("I'll run the commands…") and truncate the real answer.
+  it('never treats an assistant response_item message as terminal (mid-turn preamble + phase-less final)', () => {
     writeFileSync(path,
-      ev({
-        type: 'response_item',
-        payload: {
-          type: 'message',
-          role: 'assistant',
-          phase: 'commentary',
-          content: [{ type: 'output_text', text: 'thinking…' }],
-        },
-      }) +
-      ev(assistantFinalResponseItem('done')));
+      ev(userResponseItem('do two things')) +
+      ev(assistantMessageResponseItem("I'll run the commands.")) +   // mid-turn preamble, phase:undefined
+      ev(assistantMessageResponseItem('step1 step2 DONE')) +          // final answer, ALSO phase:undefined (0.146)
+      ev(assistantFinalResponseItem('step1 step2 DONE')));            // the real terminal
     const r = drainCodexRollout(path, 0);
-    expect(r.events).toHaveLength(1);
-    expect(r.events[0].kind).toBe('assistant_final');
-    expect(r.events[0].text).toBe('done');
+    // Exactly one user + one assistant_final (from task_complete). Neither
+    // assistant response_item produced an event.
+    expect(r.events).toHaveLength(2);
+    expect(r.events[0].kind).toBe('user');
+    expect(r.events[1].kind).toBe('assistant_final');
+    expect(r.events[1].text).toBe('step1 step2 DONE');
   });
 
-  it('skips reasoning / function_call / function_call_output / event_msg', () => {
+  // Old codex (0.139 / 0.145) still tags the final message phase:'final_answer'
+  // AND emits task_complete. We take ONLY task_complete → exactly one
+  // assistant_final, no double-close (the queue would buffer a stray second
+  // final and could mis-close a later turn).
+  it('old-codex final_answer response_item + task_complete → single assistant_final', () => {
+    writeFileSync(path,
+      ev(userResponseItem('hi')) +
+      ev(assistantMessageResponseItem('legacy final', 'final_answer')) +  // old phase-tagged final
+      ev(assistantFinalResponseItem('legacy final')));                    // task_complete for same turn
+    const r = drainCodexRollout(path, 0);
+    const finals = r.events.filter(e => e.kind === 'assistant_final');
+    expect(finals).toHaveLength(1);
+    expect(finals[0].text).toBe('legacy final');
+  });
+
+  // A task_complete with empty last_agent_message still closes the turn (a
+  // silent successful turn must release its durable delivery).
+  it('empty last_agent_message still yields an assistant_final', () => {
+    writeFileSync(path,
+      ev(userResponseItem('go')) +
+      ev({ timestamp: '2026-04-29T07:00:02.000Z', type: 'event_msg', payload: { type: 'task_complete', turn_id: 't1', last_agent_message: '' } }));
+    const r = drainCodexRollout(path, 0);
+    expect(r.events).toHaveLength(2);
+    expect(r.events[1].kind).toBe('assistant_final');
+    expect(r.events[1].text).toBe('');
+  });
+
+  it('maps the real nested -4003 task_complete error to a safe failed terminal', () => {
+    const nested = JSON.stringify({
+      error: {
+        message: "code: empty_string; message: Invalid 'input[0].tools[0].description': empty string. Expected a string with minimum length 1, but got an empty string instead.",
+        type: 'invalid_request_error',
+        param: 'input[0].tools[0].description',
+        code: '-4003',
+      },
+    });
+    writeFileSync(path,
+      ev(userResponseItem('inspect incident')) +
+      ev({
+        timestamp: '2026-08-08T02:50:18.520Z',
+        type: 'event_msg',
+        payload: {
+          type: 'task_complete',
+          turn_id: '019fdf47-40cf-7a60-9a78-718346e4ce80',
+          last_agent_message: null,
+          error: { message: nested, codex_error_info: 'other' },
+        },
+      }));
+    const failed = drainCodexRollout(path, 0).events[1];
+    expect(failed).toMatchObject({
+      kind: 'assistant_final',
+      text: '',
+      terminalStatus: 'failed',
+      terminalErrorCode: CODEX_INVALID_REQUEST_ERROR_CODE,
+    });
+    expect(failed.terminalErrorSummary).toContain('-4003 invalid_request_error');
+    expect(failed.terminalErrorSummary).toContain('input[0].tools[0].description');
+  });
+
+  it('redacts credentials and active syntax from bounded auth summaries', () => {
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: {
+        type: 'task_complete',
+        turn_id: 'auth-failure',
+        error: {
+          message: `401 Unauthorized authorization=Bearer abcdefghijklmnopqrstuvwxyz token=super-secret-value https://example.test/cb?signature=leak <at user_id="ou_secret"> @all ${'x'.repeat(500)}`,
+        },
+      },
+    }));
+    const failed = drainCodexRollout(path, 0).events[0];
+    expect(failed.terminalErrorCode).toBe(CODEX_AUTH_ERROR_CODE);
+    expect(failed.terminalErrorSummary).toContain('[REDACTED]');
+    expect(failed.terminalErrorSummary).toContain('[URL]');
+    expect(failed.terminalErrorSummary).not.toContain('abcdefghijkl');
+    expect(failed.terminalErrorSummary).not.toContain('super-secret-value');
+    expect(failed.terminalErrorSummary).not.toContain('<at');
+    expect(failed.terminalErrorSummary).not.toContain('@all');
+    expect(failed.terminalErrorSummary!.length).toBeLessThanOrEqual(320);
+  });
+
+  it('redacts quoted-JSON credential values while keeping non-secret fields', () => {
+    // Provider errors are commonly JSON payloads whose message text embeds a
+    // credential in quoted-JSON form: `"api_key":"..."`. The key name carries
+    // its own closing quote, so a bare `key[:=]` matcher misses it. The redact
+    // rule pairs the key/value quotes with backrefs and spans `\"` escapes, so
+    // the WHOLE value is removed — including values that contain an escaped
+    // quote — while quoted keys with bare-word values are left untouched.
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: {
+        type: 'task_complete',
+        turn_id: 'json-secret',
+        error: {
+          message: 'gateway rejected request for model gpt-5: {"api_key":"AbCdEf123456xyz","password":"hunter2secret"}',
+        },
+      },
+    }));
+    const failed = drainCodexRollout(path, 0).events[0];
+    expect(failed.terminalErrorSummary).toBeDefined();
+    // Secrets in quoted-JSON form are redacted.
+    expect(failed.terminalErrorSummary).not.toContain('AbCdEf123456xyz');
+    expect(failed.terminalErrorSummary).not.toContain('hunter2secret');
+    expect(failed.terminalErrorSummary).toContain('[REDACTED]');
+    // Non-secret text (the useful reason) survives — no over-redaction.
+    expect(failed.terminalErrorSummary).toContain('gpt-5');
+  });
+
+  it('redacts the whole value when a quoted-JSON secret contains an escaped quote', () => {
+    // A value like `"abc\"TAIL"` must be redacted in full. A value matcher that
+    // stopped at the first inner quote would leave the `TAIL` tail exposed.
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: {
+        type: 'task_complete',
+        turn_id: 'escaped-quote',
+        error: { message: `gateway rejected: ${JSON.stringify({ password: 'abc"TAIL_SECRET_123' })}` },
+      },
+    }));
+    const failed = drainCodexRollout(path, 0).events[0];
+    expect(failed.terminalErrorSummary).toBeDefined();
+    expect(failed.terminalErrorSummary).not.toContain('TAIL_SECRET_123');
+    expect(failed.terminalErrorSummary).toContain('[REDACTED]');
+    expect(failed.terminalErrorSummary).toContain('gateway rejected');
+  });
+
+  it('does not swallow the word after a quoted key that has a bare-word value', () => {
+    // Regression guard: `"token": a lexical unit` is NOT `key=value` — the
+    // redaction must not treat `a` as the value and delete the trailing words.
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: {
+        type: 'task_complete',
+        turn_id: 'quoted-key-bare-value',
+        error: { message: 'provider said {"token": a lexical unit failed here}' },
+      },
+    }));
+    const failed = drainCodexRollout(path, 0).events[0];
+    expect(failed.terminalErrorSummary).toBeDefined();
+    // The lexical units are ordinary prose, not a credential — keep them.
+    expect(failed.terminalErrorSummary).toContain('a lexical unit failed here');
+  });
+
+  it('fails closed (no summary) when message wrapping exceeds the unwrap depth', () => {
+    // codexFailureLeaf peels at most 6 levels. A provider that wraps
+    // `message: JSON.stringify(...)` more deeply leaves `message` as a still
+    // -nested JSON literal whose escaped quotes defeat redaction. Rather than
+    // leak the embedded secret verbatim, surface no summary.
+    let inner: string = JSON.stringify({ api_key: 'DEEP_SECRET_VALUE' });
+    for (let i = 0; i < 9; i++) inner = JSON.stringify({ message: inner });
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: {
+        type: 'task_complete',
+        turn_id: 'deep-wrap',
+        error: JSON.parse(inner),
+      },
+    }));
+    const failed = drainCodexRollout(path, 0).events[0];
+    expect(failed.terminalStatus).toBe('failed');
+    // The secret never reaches the user-facing summary.
+    expect(failed.terminalErrorSummary ?? '').not.toContain('DEEP_SECRET_VALUE');
+    expect(failed.terminalErrorSummary).toBeUndefined();
+  });
+
+  it('bounds redaction work on adversarial long input (no super-linear blowup)', () => {
+    // A JWT-shaped `-`-rich run makes the credential regexes backtrack
+    // super-linearly. The pre-scan cap must keep a large blob fast. Guard with
+    // wall-clock: unbounded, ~32k chars took seconds; bounded it is a few ms.
+    const evil = `${'a-'.repeat(16_000)}aaaaaaaaaaaa.bbbbbbbbbbbb.short`;
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: {
+        type: 'task_complete',
+        turn_id: 'redos-guard',
+        error: { message: evil },
+      },
+    }));
+    const t0 = Date.now();
+    const failed = drainCodexRollout(path, 0).events[0];
+    const elapsedMs = Date.now() - t0;
+    expect(failed.terminalStatus).toBe('failed');
+    expect((failed.terminalErrorSummary ?? '').length).toBeLessThanOrEqual(320);
+    // Generous ceiling: bounded is single-digit ms; unbounded blew past 500ms.
+    expect(elapsedMs).toBeLessThan(200);
+  });
+
+  it('does not backtrack on an unclosed quoted value full of backslashes', () => {
+    // The quoted-value redactor must use mutually-exclusive branches so a
+    // missing close quote after a run of backslashes cannot blow up. Under the
+    // old `(?:\\.|(?!close).)*` shape this took hundreds of ms at ~56 chars.
+    const evil = `gateway {"password":"${'\\'.repeat(4_000)}X`;
+    const t0 = Date.now();
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: 'backslash-redos', error: { message: evil } },
+    }));
+    const failed = drainCodexRollout(path, 0).events[0];
+    const elapsedMs = Date.now() - t0;
+    expect(failed.terminalStatus).toBe('failed');
+    expect(elapsedMs).toBeLessThan(200);
+  });
+
+  it('fails closed when the pre-scan cut leaves a credential value unclosed', () => {
+    // A real secret sitting past the pre-scan bound gets sliced mid-value,
+    // leaving `password":"SSS…` with no closing quote. The closed-value
+    // redactor would miss it and leak the prefix into the shown summary, so an
+    // unclosed credential value must fail closed instead.
+    const message = 'x'.repeat(300) + `{"password":"${'S'.repeat(1800)}"}`;
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: 'prescan-cut', error: { message } },
+    }));
+    const failed = drainCodexRollout(path, 0).events[0];
+    expect(failed.terminalStatus).toBe('failed');
+    expect(failed.terminalErrorSummary ?? '').not.toContain('SSSSS');
+    expect(failed.terminalErrorSummary).toBeUndefined();
+  });
+
+  it('keeps a word-boundary so lookalike keys like notpassword are not redacted', () => {
+    // `notpassword=VALUE` is not a `password` credential — the bare-key rule
+    // must anchor on a word boundary and leave the value intact.
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: 'word-boundary', error: { message: 'config notpassword=VISIBLE_WORD applied' } },
+    }));
+    const failed = drainCodexRollout(path, 0).events[0];
+    expect(failed.terminalErrorSummary).toBeDefined();
+    expect(failed.terminalErrorSummary).toContain('VISIBLE_WORD');
+    // A real bare `password=` in the same string is still redacted.
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: 'word-boundary-2', error: { message: 'auth password=REAL_SECRET_VAL denied' } },
+    }));
+    const failed2 = drainCodexRollout(path, 0).events[0];
+    expect(failed2.terminalErrorSummary).not.toContain('REAL_SECRET_VAL');
+    expect(failed2.terminalErrorSummary).toContain('[REDACTED]');
+  });
+
+  it('fails closed when the pre-scan cut lands on a lone dangling backslash', () => {
+    // If the 2000-char pre-scan slices mid-escape, the value tail ends in a
+    // single `\`. The unclosed-value probe must still fire (its trailing `\\?`
+    // absorbs that lone backslash) or the secret prefix leaks into the summary.
+    const prefix = 'x'.repeat(300) + '{"password":"';
+    const message = prefix + 'S'.repeat(2000 - prefix.length - 1) + '\\REST_OF_SECRET"}';
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: 'odd-backslash-cut', error: { message } },
+    }));
+    const failed = drainCodexRollout(path, 0).events[0];
+    expect(failed.terminalErrorSummary ?? '').not.toContain('SSSSS');
+    expect(failed.terminalErrorSummary).toBeUndefined();
+  });
+
+  it('redacts a bare-key quoted value containing an escaped quote', () => {
+    // `password:"abc\"TAIL"` (bare key, double-quoted value with an inner
+    // escaped quote). The bare rule's quoted-value branch must be escape-safe
+    // like the JSON-key rule, or it stops at the `\"` and leaks the tail.
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: 'bare-escaped-quote', error: { message: 'provider {password:"abc\\"TAIL_SECRET_123"} rejected' } },
+    }));
+    const failed = drainCodexRollout(path, 0).events[0];
+    expect(failed.terminalErrorSummary).toBeDefined();
+    expect(failed.terminalErrorSummary).not.toContain('TAIL_SECRET_123');
+    expect(failed.terminalErrorSummary).toContain('[REDACTED]');
+  });
+
+  it('classifies structured 429 failures for the dedicated limited state', () => {
+    writeFileSync(path, ev({
+      timestamp: '2026-08-08T02:50:18.520Z',
+      type: 'event_msg',
+      payload: {
+        type: 'task_complete',
+        turn_id: 'limited',
+        error: { message: '429 Too Many Requests' },
+      },
+    }));
+    const failed = drainCodexRollout(path, 0).events[0];
+    expect(failed.terminalErrorCode).toBe(CODEX_RATE_LIMIT_ERROR_CODE);
+    expect(isCodexRateLimitEvent(failed)).toBe(true);
+  });
+
+  // task_complete without a turn_id is a malformed/partial record — ignored
+  // (belt-and-suspenders on top of the newline-completeness guard).
+  it('task_complete without turn_id is ignored', () => {
+    writeFileSync(path,
+      ev(userResponseItem('go')) +
+      ev({ timestamp: '2026-04-29T07:00:02.000Z', type: 'event_msg', payload: { type: 'task_complete', last_agent_message: 'no turn id' } }));
+    const r = drainCodexRollout(path, 0);
+    expect(r.events).toHaveLength(1);
+    expect(r.events[0].kind).toBe('user');
+  });
+
+  // A cancelled turn writes turn_aborted (no task_complete) → ambiguous
+  // terminal so the durable delivery releases instead of wedging as running.
+  it('turn_aborted yields an ambiguous assistant_final', () => {
+    writeFileSync(path,
+      ev(userResponseItem('go')) +
+      ev({ timestamp: '2026-04-29T07:00:02.000Z', type: 'event_msg', payload: { type: 'turn_aborted', turn_id: 't1', reason: 'user interrupt' } }));
+    const r = drainCodexRollout(path, 0);
+    expect(r.events).toHaveLength(2);
+    expect(r.events[1].kind).toBe('assistant_final');
+    expect(r.events[1].terminalStatus).toBe('ambiguous');
+    expect(r.events[1].terminalErrorCode).toBe('codex_turn_aborted:user_interrupt');
+  });
+
+  // Bare/malformed CoT-adjacent items (no summary text, no call ids) and
+  // non-terminal event_msg records still produce NO events — the cot channel
+  // only fires for well-formed items (see the dedicated describe below).
+  it('skips empty reasoning / id-less function_call(+output) / non-terminal event_msg', () => {
     writeFileSync(path,
       ev({ type: 'response_item', payload: { type: 'reasoning' } }) +
       ev({ type: 'response_item', payload: { type: 'function_call', name: 'shell' } }) +
       ev({ type: 'response_item', payload: { type: 'function_call_output' } }) +
-      ev({ type: 'event_msg', payload: { type: 'task_complete', last_agent_message: 'not picked up' } }) +
+      ev({ type: 'event_msg', payload: { type: 'token_count', total: 42 } }) +
+      ev({ type: 'event_msg', payload: { type: 'agent_message', message: 'mid-turn chatter' } }) +
       ev(userResponseItem('actual prompt')));
     const r = drainCodexRollout(path, 0);
     expect(r.events).toHaveLength(1);
     expect(r.events[0].kind).toBe('user');
     expect(r.events[0].text).toBe('actual prompt');
+  });
+
+  it('emits cot events for reasoning summaries and tool calls between the turn boundaries', () => {
+    writeFileSync(path,
+      ev(userResponseItem('do the thing')) +
+      ev({ type: 'response_item', payload: { type: 'reasoning', summary: [{ type: 'summary_text', text: '**Plan** first I look around' }] } }) +
+      ev({ type: 'response_item', payload: { type: 'function_call', name: 'shell', call_id: 'call_1', arguments: '{"command":["bash","-lc","ls"]}' } }) +
+      ev({ type: 'response_item', payload: { type: 'function_call_output', call_id: 'call_1', output: '{"output":"total 24","metadata":{"exit_code":0}}' } }) +
+      ev(assistantFinalResponseItem('done')));
+    const r = drainCodexRollout(path, 0);
+    expect(r.events.map(e => e.kind)).toEqual(['user', 'cot', 'cot', 'cot', 'assistant_final']);
+    expect(r.events[1].cotEntries).toEqual([{ kind: 'thinking', text: '**Plan** first I look around' }]);
+    expect(r.events[2].cotEntries).toEqual([{ kind: 'tool_call', id: 'call_1', name: 'shell', args: '{"command":["bash","-lc","ls"]}' }]);
+    // Wrapped shell output is unwrapped to the inner text.
+    expect(r.events[3].cotEntries).toEqual([{ kind: 'tool_result', id: 'call_1', result: 'total 24' }]);
+  });
+
+  it('extracts turn_aborted as a no-output terminal edge', () => {
+    writeFileSync(path,
+      ev(userResponseItem('interrupt me')) +
+      ev({
+        timestamp: '2026-04-29T07:00:02.000Z',
+        type: 'event_msg',
+        payload: { type: 'turn_aborted', turn_id: 't1', reason: 'interrupted' },
+      }));
+    const r = drainCodexRollout(path, 0);
+    expect(r.events.map(event => ({ kind: event.kind, text: event.text, status: event.terminalStatus }))).toEqual([
+      { kind: 'user', text: 'interrupt me', status: undefined },
+      { kind: 'assistant_final', text: '', status: 'ambiguous' },
+    ]);
+  });
+
+  it('keeps an empty final_answer as a normal completed terminal edge', () => {
+    writeFileSync(path,
+      ev(userResponseItem('finish without visible text')) +
+      ev(assistantFinalResponseItem('')));
+    const r = drainCodexRollout(path, 0);
+    expect(r.events.map(event => ({ kind: event.kind, text: event.text }))).toEqual([
+      { kind: 'user', text: 'finish without visible text' },
+      { kind: 'assistant_final', text: '' },
+    ]);
   });
 
   it('skips messages with no input_text/output_text content', () => {
@@ -353,5 +808,312 @@ describe('drainCodexRollout', () => {
     const r2 = drainCodexRollout(path, r1.newOffset);
     expect(r2.events).toHaveLength(1);
     expect(r2.events[0].text).toBe('s');
+  });
+});
+
+function threadSettingsApplied(serviceTier?: string, ts = '2026-04-29T07:00:00.000Z', model = 'gpt-5.6-sol') {
+  return {
+    timestamp: ts,
+    type: 'event_msg',
+    payload: {
+      type: 'thread_settings_applied',
+      thread_settings: {
+        model,
+        model_provider_id: 'byteseed',
+        ...(serviceTier !== undefined ? { service_tier: serviceTier } : {}),
+      },
+    },
+  };
+}
+
+describe('Codex thread settings observation', () => {
+  it('returns undefined when the rollout has no applied-settings record yet', () => {
+    writeFileSync(path,
+      ev(userResponseItem('hi')) + ev(assistantFinalResponseItem('hello')));
+    expect(scanCodexThreadSettings(path)).toBeUndefined();
+  });
+
+  it('returns undefined for a missing / empty rollout file', () => {
+    expect(scanCodexThreadSettings(join(dir, 'does-not-exist.jsonl'))).toBeUndefined();
+    writeFileSync(path, '');
+    expect(scanCodexThreadSettings(path)).toBeUndefined();
+  });
+
+  it('reads the applied model and service tier', () => {
+    writeFileSync(path,
+      ev(threadSettingsApplied('default')) + ev(userResponseItem('hi')));
+    expect(scanCodexThreadSettings(path)).toEqual({
+      model: 'gpt-5.6-sol',
+      serviceTier: 'default',
+    });
+  });
+
+  it('returns the LATEST applied tier when the session switched mid-way', () => {
+    writeFileSync(path,
+      ev(threadSettingsApplied('default', '2026-04-29T07:00:00.000Z')) +
+      ev(userResponseItem('go fast')) +
+      ev(threadSettingsApplied('priority', '2026-04-29T07:05:00.000Z')) +
+      ev(assistantFinalResponseItem('done')));
+    expect(scanCodexThreadSettings(path)).toEqual({
+      model: 'gpt-5.6-sol',
+      serviceTier: 'priority',
+    });
+  });
+
+  it('ignores non-settings lines and tolerates malformed json', () => {
+    writeFileSync(path,
+      'not json at all\n' +
+      ev(userResponseItem('hi')) +
+      ev(threadSettingsApplied('priority')) +
+      'still garbage\n');
+    expect(scanCodexThreadSettings(path)?.serviceTier).toBe('priority');
+  });
+
+  it('treats a valid settings event that carries no service_tier as default', () => {
+    writeFileSync(path, ev(threadSettingsApplied()));
+    expect(scanCodexThreadSettings(path)).toEqual({
+      model: 'gpt-5.6-sol',
+      serviceTier: 'default',
+    });
+  });
+
+  it('reads the top-level reasoning_effort (follows an in-session /effort switch)', () => {
+    writeFileSync(path, ev({
+      timestamp: '2026-04-29T07:00:00.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'thread_settings_applied',
+        thread_settings: {
+          model: 'gpt-5.6-sol',
+          service_tier: 'default',
+          reasoning_effort: 'xhigh',
+        },
+      },
+    }));
+    expect(scanCodexThreadSettings(path)).toEqual({
+      model: 'gpt-5.6-sol',
+      reasoningEffort: 'xhigh',
+      serviceTier: 'default',
+    });
+  });
+
+  it('falls back to collaboration_mode.settings.reasoning_effort when no top-level effort', () => {
+    writeFileSync(path, ev({
+      timestamp: '2026-04-29T07:00:00.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'thread_settings_applied',
+        thread_settings: {
+          model: 'gpt-5.6-sol',
+          service_tier: 'default',
+          collaboration_mode: { settings: { reasoning_effort: 'high' } },
+        },
+      },
+    }));
+    expect(scanCodexThreadSettings(path)?.reasoningEffort).toBe('high');
+  });
+
+  it('reports the latest settings from the newly appended byte range', () => {
+    writeFileSync(path,
+      ev(threadSettingsApplied('default')) + ev(userResponseItem('first')));
+    const first = drainCodexRollout(path, 0);
+    expect(first.latestThreadSettings).toEqual({
+      model: 'gpt-5.6-sol',
+      serviceTier: 'default',
+    });
+
+    // Both toggles can land between two 1s bridge polls. The final executor
+    // state must still be observed even when no PTY screen update follows.
+    appendFileSync(path,
+      ev(threadSettingsApplied('priority', '2026-04-29T07:01:00.000Z'))
+      + ev(threadSettingsApplied('default', '2026-04-29T07:01:00.100Z')));
+    const second = drainCodexRollout(path, first.newOffset);
+
+    expect(second.events).toEqual([]);
+    expect(second.latestThreadSettings).toEqual({
+      model: 'gpt-5.6-sol',
+      serviceTier: 'default',
+    });
+  });
+
+  it('clears a live priority snapshot when Codex omits service_tier', () => {
+    writeFileSync(path, ev(threadSettingsApplied('priority')));
+    const first = drainCodexRollout(path, 0);
+    expect(first.latestThreadSettings?.serviceTier).toBe('priority');
+
+    appendFileSync(path, ev(threadSettingsApplied(undefined, '2026-04-29T07:01:00.000Z')));
+    const second = drainCodexRollout(path, first.newOffset);
+    expect(second.latestThreadSettings).toEqual({
+      model: 'gpt-5.6-sol',
+      serviceTier: 'default',
+    });
+  });
+
+  it('backward scan returns the newest omitted service_tier as default', () => {
+    writeFileSync(path,
+      ev(threadSettingsApplied('priority'))
+      + ev(threadSettingsApplied(undefined, '2026-04-29T07:01:00.000Z')));
+    expect(scanCodexThreadSettings(path)).toEqual({
+      model: 'gpt-5.6-sol',
+      serviceTier: 'default',
+    });
+  });
+
+  it('reverse-scans across chunk and UTF-8 boundaries without loading the whole rollout', () => {
+    const latest = ev(threadSettingsApplied('priority', '2026-04-29T07:05:00.000Z'));
+    // 900 trailing bytes force the preceding settings line to straddle the
+    // scanner's 1024-byte read boundary. Earlier multi-byte content exercises
+    // the byte-oriented carry path as well.
+    writeFileSync(path,
+      ev(threadSettingsApplied('default'))
+      + ev(userResponseItem('边界'.repeat(800)))
+      + latest
+      + `${'x'.repeat(899)}\n`);
+
+    expect(scanCodexThreadSettings(path, { chunkBytes: 1024 })).toEqual({
+      model: 'gpt-5.6-sol',
+      serviceTier: 'priority',
+    });
+  });
+});
+
+function turnContext(opts: {
+  model?: string;
+  effort?: string;
+  settingsModel?: string;
+  settingsEffort?: string;
+  ts?: string;
+} = {}) {
+  const payload: any = { turn_id: `turn-${opts.ts ?? 'x'}` };
+  if (opts.model !== undefined) payload.model = opts.model;
+  if (opts.effort !== undefined) payload.effort = opts.effort;
+  if (opts.settingsModel !== undefined || opts.settingsEffort !== undefined) {
+    payload.collaboration_mode = {
+      settings: {
+        ...(opts.settingsModel !== undefined ? { model: opts.settingsModel } : {}),
+        ...(opts.settingsEffort !== undefined ? { reasoning_effort: opts.settingsEffort } : {}),
+      },
+    };
+  }
+  return {
+    timestamp: opts.ts ?? '2026-04-29T07:00:00.000Z',
+    type: 'turn_context',
+    payload,
+  };
+}
+
+describe('Codex turn_context runtime (drain)', () => {
+  it('surfaces model + effort from a turn_context (the per-turn source)', () => {
+    writeFileSync(path, ev(turnContext({ model: 'gpt-5.6-sol', effort: 'xhigh' })));
+    const r = drainCodexRollout(path, 0);
+    expect(r.latestModel).toBe('gpt-5.6-sol');
+    expect(r.latestReasoningEffort).toBe('xhigh');
+  });
+
+  it('falls back to collaboration_mode.settings for model/effort', () => {
+    writeFileSync(path, ev(turnContext({ settingsModel: 'gpt-5.6-sol', settingsEffort: 'high' })));
+    const r = drainCodexRollout(path, 0);
+    expect(r.latestModel).toBe('gpt-5.6-sol');
+    expect(r.latestReasoningEffort).toBe('high');
+  });
+
+  it('is latest-wins across multiple turn_context records (independent /model, /effort)', () => {
+    writeFileSync(path,
+      ev(turnContext({ model: 'gpt-5.6-sol', effort: 'low', ts: '2026-04-29T07:00:00.000Z' }))
+      + ev(userResponseItem('switch'))
+      + ev(turnContext({ model: 'gpt-5.6-pro', effort: 'xhigh', ts: '2026-04-29T07:01:00.000Z' })));
+    const r = drainCodexRollout(path, 0);
+    expect(r.latestModel).toBe('gpt-5.6-pro');
+    expect(r.latestReasoningEffort).toBe('xhigh');
+  });
+
+  it('leaves runtime undefined when no turn_context appears', () => {
+    writeFileSync(path, ev(userResponseItem('hi')) + ev(assistantFinalResponseItem('yo')));
+    const r = drainCodexRollout(path, 0);
+    expect(r.latestModel).toBeUndefined();
+    expect(r.latestReasoningEffort).toBeUndefined();
+  });
+
+  it('reports runtime only from the newly appended byte range on an incremental drain', () => {
+    writeFileSync(path, ev(turnContext({ model: 'gpt-5.6-sol', effort: 'low' })));
+    const first = drainCodexRollout(path, 0);
+    expect(first.latestReasoningEffort).toBe('low');
+    appendFileSync(path,
+      ev(userResponseItem('go'))
+      + ev(turnContext({ model: 'gpt-5.6-sol', effort: 'xhigh', ts: '2026-04-29T07:02:00.000Z' })));
+    const second = drainCodexRollout(path, first.newOffset);
+    expect(second.latestReasoningEffort).toBe('xhigh');
+  });
+});
+
+describe('readLatestCodexRuntime (attach bootstrap)', () => {
+  it('returns {} for a missing / empty rollout', () => {
+    expect(readLatestCodexRuntime(join(dir, 'nope.jsonl'))).toEqual({});
+    writeFileSync(path, '');
+    expect(readLatestCodexRuntime(path)).toEqual({});
+  });
+
+  it('reads the newest turn_context model + effort near the tail', () => {
+    writeFileSync(path,
+      ev(turnContext({ model: 'gpt-5.6-sol', effort: 'low', ts: '2026-04-29T07:00:00.000Z' }))
+      + ev(userResponseItem('later'))
+      + ev(turnContext({ model: 'gpt-5.6-pro', effort: 'xhigh', ts: '2026-04-29T07:09:00.000Z' })));
+    expect(readLatestCodexRuntime(path)).toEqual({ model: 'gpt-5.6-pro', reasoningEffort: 'xhigh' });
+  });
+
+  it('excludes a non-newline-terminated trailing partial (crash mid-write)', () => {
+    writeFileSync(path,
+      ev(turnContext({ model: 'gpt-5.6-sol', effort: 'xhigh' }))
+      + JSON.stringify(turnContext({ model: 'half-written', effort: 'garbage' })));
+    // The half-written last line has no trailing \n → excluded; the prior
+    // complete record wins.
+    expect(readLatestCodexRuntime(path)).toEqual({ model: 'gpt-5.6-sol', reasoningEffort: 'xhigh' });
+  });
+});
+
+describe('codexCotEntriesFromResponseItem (CoT thinking timeline)', () => {
+  it('joins multiple summary_text blocks; falls back to reasoning_text when summary is empty', () => {
+    expect(codexCotEntriesFromResponseItem({
+      type: 'reasoning',
+      summary: [{ type: 'summary_text', text: 'a' }, { type: 'summary_text', text: 'b' }],
+    })).toEqual([{ kind: 'thinking', text: 'a\n\nb' }]);
+    expect(codexCotEntriesFromResponseItem({
+      type: 'reasoning',
+      summary: [],
+      content: [{ type: 'reasoning_text', text: 'raw chain of thought' }],
+    })).toEqual([{ kind: 'thinking', text: 'raw chain of thought' }]);
+  });
+
+  it('truncates oversized function_call arguments with an ellipsis', () => {
+    const args = `{"content":"${'x'.repeat(2000)}"}`;
+    const [entry] = codexCotEntriesFromResponseItem({ type: 'function_call', name: 'apply_patch', call_id: 'c1', arguments: args });
+    expect(entry).toMatchObject({ kind: 'tool_call', id: 'c1', name: 'apply_patch' });
+    expect((entry as any).args.length).toBe(601); // 600-char cap + '…'
+    expect((entry as any).args.endsWith('…')).toBe(true);
+  });
+
+  it('maps local_shell_call and web_search_call to named tool calls', () => {
+    expect(codexCotEntriesFromResponseItem({
+      type: 'local_shell_call', call_id: 'c2', status: 'completed', action: { type: 'exec', command: ['ls'] },
+    })).toEqual([{ kind: 'tool_call', id: 'c2', name: 'shell', args: '{"type":"exec","command":["ls"]}' }]);
+    expect(codexCotEntriesFromResponseItem({
+      type: 'web_search_call', id: 'ws1', action: { query: 'feishu cot' },
+    })).toEqual([{ kind: 'tool_call', id: 'ws1', name: 'web_search', args: '{"query":"feishu cot"}' }]);
+  });
+
+  it('keeps a raw (non-wrapped) function_call_output string and maps custom tool calls', () => {
+    expect(codexCotEntriesFromResponseItem({ type: 'function_call_output', call_id: 'c1', output: 'plain output' }))
+      .toEqual([{ kind: 'tool_result', id: 'c1', result: 'plain output' }]);
+    expect(codexCotEntriesFromResponseItem({ type: 'custom_tool_call', name: 'my_tool', call_id: 'c3', input: '{"x":1}' }))
+      .toEqual([{ kind: 'tool_call', id: 'c3', name: 'my_tool', args: '{"x":1}' }]);
+    expect(codexCotEntriesFromResponseItem({ type: 'custom_tool_call_output', call_id: 'c3', output: 'ok' }))
+      .toEqual([{ kind: 'tool_result', id: 'c3', result: 'ok' }]);
+  });
+
+  it('returns [] for messages, ghost snapshots and empty outputs', () => {
+    expect(codexCotEntriesFromResponseItem({ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'hi' }] })).toEqual([]);
+    expect(codexCotEntriesFromResponseItem({ type: 'ghost_snapshot' })).toEqual([]);
+    expect(codexCotEntriesFromResponseItem({ type: 'function_call_output', call_id: 'c1', output: '' })).toEqual([]);
+    expect(codexCotEntriesFromResponseItem(undefined)).toEqual([]);
   });
 });

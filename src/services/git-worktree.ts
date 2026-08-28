@@ -72,6 +72,14 @@ async function resolveBaseRef(repo: string): Promise<string> {
   return 'HEAD';
 }
 
+/** Cheap, network-free check that `dir` is inside a git work tree. Used to
+ *  decide BEFORE posting a "creating worktree…" notice whether creation can even
+ *  be attempted — a non-git default dir fails instantly and silently rather than
+ *  spamming a creating→failed message pair on every new session. */
+export async function isGitWorkTree(dir: string): Promise<boolean> {
+  return (await tryGit(['rev-parse', '--is-inside-work-tree'], resolve(dir), 5_000)) === 'true';
+}
+
 /** Branch names may contain `/` etc. — flatten to a filesystem-safe suffix. */
 export function dirSuffixForBranch(branch: string): string {
   return branch.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'branch';
@@ -233,6 +241,18 @@ export async function createRepoWorktree(
   await git(['worktree', 'add', '-b', branch, wtPath, baseRef], repo, 60_000);
   logger.info(`[git-worktree] created ${wtPath} (branch ${branch} from ${baseRef})`);
   return { path: wtPath, branch, baseRef };
+}
+
+/**
+ * Push a freshly created worktree branch to origin (`push -u`). Used by the
+ * riff flow: the remote sandbox clones from origin, so a local-only worktree
+ * branch is invisible to it — pushing the branch pointer (no new objects,
+ * seconds) lets the riff task pin the new branch. Throws on failure; callers
+ * degrade to the default-branch fallback with a warning.
+ */
+export async function pushWorktreeBranch(worktreePath: string, branch: string): Promise<void> {
+  await git(['push', '-u', 'origin', branch], resolve(worktreePath), 60_000);
+  logger.info(`[git-worktree] pushed branch ${branch} to origin (${worktreePath})`);
 }
 
 /** Remove a worktree created by {@link createRepoWorktree}. Used to roll back the

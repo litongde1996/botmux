@@ -16,9 +16,16 @@ import {
 } from '../services/webhook-key.js';
 import { platformMachineBaseUrl } from '../platform/binding.js';
 import { isRemoteAccessEnabled } from '../global-config.js';
-import { listTriggerLogs, pruneTriggerLogs, summarizeTriggerLogs, type TriggerLogStats } from '../services/trigger-log-store.js';
-import type { TriggerErrorCode } from '../services/trigger-types.js';
-import { jsonRes } from './workflow-api.js';
+import {
+  pruneTriggerLogs,
+  queryTriggerLogs,
+  summarizeTriggerLogOverview,
+  summarizeTriggerLogs,
+  type TriggerLogListOptions,
+  type TriggerLogStats,
+} from '../services/trigger-log-store.js';
+import type { TriggerAction, TriggerErrorCode } from '../services/trigger-types.js';
+import { jsonRes } from './http.js';
 
 const DEFAULT_VERIFY_HEADERS = {
   signatureHeader: 'x-botmux-signature',
@@ -66,6 +73,25 @@ function logStatus(v: string | null): 'ok' | 'error' | undefined {
   return v === 'ok' || v === 'error' ? v : undefined;
 }
 
+function logAction(v: string | null): TriggerAction | 'failed' | undefined {
+  return v && ['queued', 'delivered', 'dry_run', 'ignored', 'completed', 'failed'].includes(v)
+    ? v as TriggerAction | 'failed'
+    : undefined;
+}
+
+function triggerLogFilters(url: URL): TriggerLogListOptions {
+  const errorCode = url.searchParams.get('errorCode') as TriggerErrorCode | null;
+  return {
+    connectorId: url.searchParams.get('connectorId') ?? undefined,
+    status: logStatus(url.searchParams.get('status')),
+    errorCode: errorCode ?? undefined,
+    method: url.searchParams.get('method') ?? undefined,
+    action: logAction(url.searchParams.get('action')),
+    query: url.searchParams.get('q') ?? undefined,
+    since: url.searchParams.get('since') ?? undefined,
+  };
+}
+
 function emptyStats(connectorId: string): TriggerLogStats {
   return { connectorId, total: 0, ok: 0, error: 0, actions: {}, errorCodes: {} };
 }
@@ -77,6 +103,101 @@ function normalizeLifecycleExtractors(v: unknown): ConnectorDefinition['lifecycl
   return { dedupKey: r.dedupKey.trim() };
 }
 
+function normalizeTopicMessage(
+  value: unknown,
+  prior: ConnectorDefinition['topicMessage'] | undefined,
+): { ok: true; value: NonNullable<ConnectorDefinition['topicMessage']> } | { ok: false; error: string } {
+  const raw = record(value ?? prior);
+  const mode = typeof raw.mode === 'string' ? raw.mode : prior?.mode ?? 'default';
+  if (!['default', 'custom', 'template', 'none'].includes(mode)) {
+    return { ok: false, error: 'bad_topic_message_mode' };
+  }
+  if (mode !== 'custom' && mode !== 'template') {
+    return { ok: true, value: { mode } as NonNullable<ConnectorDefinition['topicMessage']> };
+  }
+
+  const text = typeof raw.text === 'string' ? raw.text.trim() : prior?.text?.trim() ?? '';
+  if (!text) return { ok: false, error: mode === 'template' ? 'topic_message_template_required' : 'topic_message_required' };
+  if (Array.from(text).length > 200) {
+    return { ok: false, error: mode === 'template' ? 'topic_message_template_too_long' : 'topic_message_too_long' };
+  }
+  if (mode === 'custom') return { ok: true, value: { mode: 'custom', text } };
+
+  const extractorsInput = raw.extractors ?? (prior?.mode === 'template' ? prior.extractors : undefined) ?? {};
+  if (!extractorsInput || typeof extractorsInput !== 'object' || Array.isArray(extractorsInput)) {
+    return { ok: false, error: 'topic_message_template_extractors_invalid' };
+  }
+  const extractorEntries = Object.entries(extractorsInput as Record<string, unknown>);
+  if (extractorEntries.length > 20) return { ok: false, error: 'topic_message_template_extractors_too_many' };
+
+  const extractors: NonNullable<ConnectorDefinition['topicMessage']>['extractors'] = {};
+  const aliasPattern = /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/;
+  const pathPattern = /^(?:\$\.)?[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$/;
+  const unsafePathSegments = new Set(['__proto__', 'prototype', 'constructor']);
+  const validPath = (path: string): boolean => {
+    if (!pathPattern.test(path)) return false;
+    const normalized = path.startsWith('$.') ? path.slice(2) : path;
+    return normalized.split('.').every(segment => !unsafePathSegments.has(segment));
+  };
+
+  for (const [alias, value] of extractorEntries) {
+    if (!aliasPattern.test(alias) || !value || typeof value !== 'object' || Array.isArray(value)) {
+      return { ok: false, error: 'topic_message_template_extractor_invalid' };
+    }
+    const extractor = value as Record<string, unknown>;
+    const path = typeof extractor.path === 'string' ? extractor.path.trim() : '';
+    const kind = extractor.kind;
+    const identityPath = typeof extractor.identityPath === 'string' ? extractor.identityPath.trim() : undefined;
+    const namePath = typeof extractor.namePath === 'string' ? extractor.namePath.trim() : undefined;
+    if (!validPath(path) || (kind !== 'text' && kind !== 'mention')) {
+      return { ok: false, error: 'topic_message_template_extractor_invalid' };
+    }
+    if (kind === 'text' && (identityPath || namePath)) {
+      return { ok: false, error: 'topic_message_template_extractor_invalid' };
+    }
+    if ((identityPath && !validPath(identityPath)) || (namePath && !validPath(namePath))) {
+      return { ok: false, error: 'topic_message_template_extractor_invalid' };
+    }
+    extractors[alias] = {
+      path,
+      kind,
+      ...(identityPath ? { identityPath } : {}),
+      ...(namePath ? { namePath } : {}),
+    };
+  }
+
+  const tokenPattern = /{{\s*(?:(mention)\s+)?([A-Za-z][A-Za-z0-9_.-]{0,63})\s*}}/g;
+  const stripped = text.replace(tokenPattern, (_token, mention: string | undefined, alias: string) => {
+    if (alias === 'source') return mention ? '{{invalid}}' : '';
+    const extractor = extractors[alias];
+    if (!extractor) return '{{missing}}';
+    if ((mention ? 'mention' : 'text') !== extractor.kind) return '{{mismatch}}';
+    return '';
+  });
+  if (stripped.includes('{{') || stripped.includes('}}')) {
+    return { ok: false, error: 'topic_message_template_token_invalid' };
+  }
+  return { ok: true, value: { mode: 'template', text, extractors } };
+}
+
+function sameStringSet(left: string[] | undefined, right: string[] | undefined): boolean {
+  return JSON.stringify([...new Set(left ?? [])].sort())
+    === JSON.stringify([...new Set(right ?? [])].sort());
+}
+
+function sameConnectorTarget(
+  left: ConnectorDefinition['target'],
+  right: ConnectorDefinition['target'],
+): boolean {
+  return left.mode === right.mode
+    && left.kind === right.kind
+    && left.botId === right.botId
+    && left.chatId === right.chatId
+    && left.workflowId === right.workflowId
+    && sameStringSet(left.botIds, right.botIds)
+    && sameStringSet(left.allowChats, right.allowChats);
+}
+
 function normalizeConnectorInput(
   raw: unknown,
   opts: { id?: string; prior?: ConnectorDefinition | null; secretRef?: string },
@@ -84,6 +205,7 @@ function normalizeConnectorInput(
   const body = record(raw);
   const c = record(body.connector ?? body);
   const prior = opts.prior ?? null;
+  const targetProvided = hasOwn(c, 'target');
   const verify = record(c.verify ?? prior?.verify);
   const target = record(c.target ?? prior?.target);
   const promptEnvelope = record(c.promptEnvelope ?? prior?.promptEnvelope);
@@ -103,14 +225,20 @@ function normalizeConnectorInput(
   const botIds = hasOwn(target, 'botIds')
     ? Array.from(new Set(stringList(target.botIds).map(x => x.trim()).filter(Boolean)))
     : prior?.target.botIds;
-  const chatId = typeof target.chatId === 'string' && target.chatId.trim() ? target.chatId.trim() : prior?.target.chatId;
+  const chatId = targetMode === 'fixed'
+    ? (typeof target.chatId === 'string' && target.chatId.trim() ? target.chatId.trim() : prior?.target.chatId)
+    : undefined;
   if (targetMode === 'fixed' && !chatId) return { ok: false, error: 'fixed_chat_required' };
-  const workflowId = typeof target.workflowId === 'string' && target.workflowId.trim() ? target.workflowId.trim() : prior?.target.workflowId;
+  const workflowId = targetKind === 'workflow'
+    ? (typeof target.workflowId === 'string' && target.workflowId.trim() ? target.workflowId.trim() : prior?.target.workflowId)
+    : undefined;
   if (targetKind === 'workflow' && !workflowId) return { ok: false, error: 'workflow_id_required' };
   // Dedup is now OPTIONAL for new-group (null = a fresh group per event).
-  const lifecycleExtractors = c.lifecycleExtractors === undefined
-    ? (prior?.lifecycleExtractors ?? null)
-    : normalizeLifecycleExtractors(c.lifecycleExtractors);
+  const lifecycleExtractors = targetMode === 'new-group'
+    ? (c.lifecycleExtractors === undefined
+      ? (prior?.lifecycleExtractors ?? null)
+      : normalizeLifecycleExtractors(c.lifecycleExtractors))
+    : null;
 
   const secretRef =
     opts.secretRef ||
@@ -122,6 +250,8 @@ function normalizeConnectorInput(
     verify.type === 'hmac-sha256' || verify.type === 'token'
       ? verify.type
       : prior?.verify.type ?? 'token';
+  const topicMessage = normalizeTopicMessage(c.topicMessage, prior?.topicMessage);
+  if (!topicMessage.ok) return topicMessage;
 
   const now = new Date().toISOString();
   const next: ConnectorDefinition = {
@@ -142,13 +272,15 @@ function normalizeConnectorInput(
         : prior?.verify.nonceHeader ?? DEFAULT_VERIFY_HEADERS.nonceHeader,
       toleranceSeconds: positiveInt(verify.toleranceSeconds, prior?.verify.toleranceSeconds ?? DEFAULT_VERIFY_HEADERS.toleranceSeconds, 30, 86_400),
     },
-    target: {
+    target: prior?.target.kind === 'workflow' && !targetProvided ? { ...prior.target } : {
       mode: targetMode as ConnectorDefinition['target']['mode'],
       kind: targetKind as ConnectorDefinition['target']['kind'],
       botId,
       ...(botIds && botIds.length > 0 ? { botIds: botIds.includes(botId) ? botIds : [botId, ...botIds] } : {}),
       ...(chatId ? { chatId } : {}),
-      ...(hasOwn(target, 'allowChats') ? { allowChats: stringList(target.allowChats) } : prior?.target.allowChats ? { allowChats: prior.target.allowChats } : {}),
+      ...(targetMode === 'dynamic'
+        ? { allowChats: hasOwn(target, 'allowChats') ? stringList(target.allowChats) : (prior?.target.allowChats ?? []) }
+        : {}),
       ...(workflowId ? { workflowId } : {}),
     },
     promptEnvelope: {
@@ -166,8 +298,10 @@ function normalizeConnectorInput(
         ? (promptEnvelope.instruction.trim() ? { instruction: promptEnvelope.instruction.trim().slice(0, 8000) } : {})
         : prior?.promptEnvelope.instruction ? { instruction: prior.promptEnvelope.instruction } : {}),
     },
+    topicMessage: topicMessage.value,
+    ...(bool(c.suppressFinalOutput, prior?.suppressFinalOutput ?? false) ? { suppressFinalOutput: true } : {}),
     loggingPolicy: {
-      storePayload: bool(loggingPolicy.storePayload, prior?.loggingPolicy.storePayload ?? false),
+      storePayload: bool(loggingPolicy.storePayload, prior?.loggingPolicy.storePayload ?? true),
       storeHeaders: bool(loggingPolicy.storeHeaders, prior?.loggingPolicy.storeHeaders ?? true),
       retentionDays: positiveInt(loggingPolicy.retentionDays, prior?.loggingPolicy.retentionDays ?? 14, 1, 365),
     },
@@ -181,6 +315,21 @@ function normalizeConnectorInput(
     createdAt: prior?.createdAt ?? now,
     updatedAt: prior?.updatedAt ?? now,
   };
+
+  // Workflow targets belong to the retiring v2 engine. Keep existing assets
+  // maintainable during the migration window, but never create a new entry,
+  // convert a turn connector into one, or let an existing workflow connector
+  // drift to a different target. Non-target fields (name, prompt, secret,
+  // enabled state, logging policy, etc.) remain editable.
+  if (!prior && next.target.kind === 'workflow') {
+    return { ok: false, error: 'legacy_workflow_connector_creation_disabled' };
+  }
+  if (prior?.target.kind === 'turn' && next.target.kind === 'workflow') {
+    return { ok: false, error: 'legacy_workflow_connector_creation_disabled' };
+  }
+  if (prior?.target.kind === 'workflow' && !sameConnectorTarget(next.target, prior.target)) {
+    return { ok: false, error: 'legacy_workflow_connector_target_immutable' };
+  }
   return { ok: true, connector: next };
 }
 
@@ -304,6 +453,18 @@ export async function handleConnectorApi(
       }
       try {
         const body = await readJsonBody<any>(req);
+        // Validate the complete update before rotating the secret. In
+        // particular, a rejected legacy-workflow target mutation must not
+        // leave behind an otherwise successful credential side effect.
+        const preflight = normalizeConnectorInput({ ...body, id }, {
+          id,
+          prior,
+          secretRef: prior.verify.secretRef,
+        });
+        if (!preflight.ok) {
+          jsonRes(res, 400, { ok: false, error: preflight.error });
+          return true;
+        }
         let generatedSecret: string | undefined;
         let secretRef: string | undefined;
         let plaintextForUrl: string | undefined;
@@ -366,13 +527,15 @@ export async function handleConnectorApi(
     return true;
   }
 
+  if (req.method === 'GET' && url.pathname === '/api/trigger-logs/summary') {
+    jsonRes(res, 200, { summary: summarizeTriggerLogOverview(triggerLogFilters(url)) });
+    return true;
+  }
+
   if (req.method === 'GET' && url.pathname === '/api/trigger-logs') {
     const limit = Number(url.searchParams.get('limit') ?? '100');
-    const connectorId = url.searchParams.get('connectorId') ?? undefined;
-    const status = logStatus(url.searchParams.get('status'));
-    const errorCode = url.searchParams.get('errorCode') as TriggerErrorCode | null;
-    const since = url.searchParams.get('since') ?? undefined;
-    jsonRes(res, 200, { logs: listTriggerLogs({ limit, connectorId, status, errorCode: errorCode ?? undefined, since }) });
+    const offset = Number(url.searchParams.get('offset') ?? '0');
+    jsonRes(res, 200, queryTriggerLogs({ ...triggerLogFilters(url), limit, offset }));
     return true;
   }
 

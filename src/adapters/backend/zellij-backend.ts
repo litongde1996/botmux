@@ -1,11 +1,13 @@
 import * as pty from 'node-pty';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { SessionBackend, SpawnOpts, SessionProbe } from './types.js';
 import { zellijEnv, probeZellijFunctional } from '../../setup/ensure-zellij.js';
-import { resolveUserShell, buildBotmuxEnvAssignments, SHELL_WRAPPER_SCRIPT } from './tmux-backend.js';
+import { resolveUserShell, buildBotmuxEnvAssignments, shellWrapperScript, shellCommandArgv, shellKindForPath } from './tmux-backend.js';
+import { resolveBotmuxWrapperBinDir } from '../../core/botmux-wrapper.js';
 import { logger } from '../../utils/logger.js';
 
 /**
@@ -119,22 +121,6 @@ export class ZellijBackend implements SessionBackend {
     return probe.sessions.includes(name) ? 'exists' : 'missing';
   }
 
-  /**
-   * Tri-state liveness of the zellij SERVER (not a specific session). Mirrors
-   * TmuxBackend.serverState — see that doc for why 'missing' must be
-   * disambiguated before driving a destructive restore-time close.
-   *
-   *   - 'running' — list-sessions succeeded with ≥1 live session.
-   *   - 'down'    — list-sessions succeeded with ZERO live sessions, i.e. nothing
-   *                 survives (a machine reboot wipes every session at once).
-   *   - 'unknown' — list-sessions failed/timed out (can't tell).
-   */
-  static serverState(): 'running' | 'down' | 'unknown' {
-    const probe = ZellijBackend.probeLiveSessions();
-    if (!probe.ok) return 'unknown';
-    return probe.sessions.length > 0 ? 'running' : 'down';
-  }
-
   /** Kill + purge a session (so no resurrectable corpse accumulates). */
   static killSession(name: string): void {
     try {
@@ -200,20 +186,24 @@ export class ZellijBackend implements SessionBackend {
   // are forwarded verbatim to the focused pane — so every input path collapses
   // to pty.write(), exactly like TmuxBackend.write().
 
-  write(data: string): void {
-    this.process?.write(data);
+  write(data: string): boolean {
+    if (!this.process) return false;
+    this.process.write(data);
+    return true;
   }
 
   /** Literal text, no Enter. */
-  sendText(text: string): void {
-    this.process?.write(text);
+  sendText(text: string): boolean {
+    return this.write(text);
   }
 
   /** Special keys by tmux-style name (Enter, Escape, C-c, M-Enter, …). */
-  sendSpecialKeys(...keys: string[]): void {
+  sendSpecialKeys(...keys: string[]): boolean {
+    if (!this.process) return false;
     for (const key of keys) {
-      this.process?.write(tmuxKeyToBytes(key));
+      this.process.write(tmuxKeyToBytes(key));
     }
+    return true;
   }
 
   /** Bracketed paste: wrap with \e[200~ … \e[201~ so TUIs (CoCo/Ink/Codex)
@@ -308,23 +298,22 @@ export function kdlString(s: string): string {
  * / mise shims load from rcfiles). Command + args go in via execvp semantics —
  * no shell-quoting needed (KDL strings carry spaces/quotes), only KDL escaping.
  *
- *   pane command="<shell>" close_on_exit=true {
- *       args "<flag>"… "-c" "<script>" "_" "<cwd>" "KEY=VAL"… "<bin>" "<arg>"…
- *   }
+ * POSIX shell layouts keep the `-c <script> _ <cwd>...` contract; fish
+ * layouts omit the `_` sentinel because fish exposes post-script args as $argv.
  */
 export function buildLayoutString(bin: string, args: string[], opts: SpawnOpts): string {
   const shellSpec = resolveUserShell(process.env, opts.launchShell);
   const envAssignments = buildBotmuxEnvAssignments(opts.env, opts.injectEnv);
-  const paneArgs = [
-    ...shellSpec.flags, '-c', SHELL_WRAPPER_SCRIPT, '_',
+  const kind = shellKindForPath(shellSpec.shell);
+  const [cmd, ...paneArgs] = shellCommandArgv(shellSpec, shellWrapperScript(resolveBotmuxWrapperBinDir(opts.env ?? process.env), kind), [
     opts.cwd,
     ...envAssignments,
     bin, ...args,
-  ];
+  ]);
   const argsKdl = paneArgs.map(kdlString).join(' ');
   return [
     'layout {',
-    `    pane command=${kdlString(shellSpec.shell)} close_on_exit=true {`,
+    `    pane command=${kdlString(cmd)} close_on_exit=true {`,
     `        args ${argsKdl}`,
     '    }',
     '}',
@@ -377,7 +366,50 @@ export function tmuxKeyToBytes(key: string): string {
  * the trailing path component of the server's socket argument, so we match the
  * cmdline ending in `/<sessionName>`.
  */
+/** A running `zellij --server <socketPath>` process. */
+export interface ZellijServerProc {
+  pid: number;
+  /** The socket path from argv — the session name AT SPAWN TIME. */
+  socketPath: string;
+}
+
+/** Parse `ps -eo pid=,args=` output into the zellij server processes. Pure. */
+export function parseZellijServerProcs(psOut: string): ZellijServerProc[] {
+  const servers: ZellijServerProc[] = [];
+  for (const line of psOut.split('\n')) {
+    const m = line.trim().match(/^(\d+)\s+(.*)$/);
+    if (!m) continue;
+    const argv = m[2]!.trim();
+    const s = argv.match(/zellij\b.*--server\s+(\S+)$/);
+    if (s) servers.push({ pid: Number(m[1]), socketPath: s[1]! });
+  }
+  return servers;
+}
+
+/**
+ * Session-name → server-pid lookup, rename-proof and reuse-proof.
+ *
+ * Why there is NO argv "fast path" on Linux (Codex review, PR #468):
+ * `zellij action rename-session` (what the session-manager plugin drives)
+ * renames the session's SOCKET FILE, but the server's argv and the kernel's
+ * bound-address string (/proc/net/unix) keep the spawn-time path forever, and
+ * a freed name is REUSABLE by new spawns or other renames (verified live on
+ * 0.44.1). So ANY lookup keyed on names — argv tail, bound path, even
+ * "unique candidate + file exists" — can bind a session's name to a DIFFERENT
+ * session's server (spawn old → rename → spawn old again; or rename another
+ * session TO the freed name). Misbinding crosses sessions in adopt discovery
+ * / validation / backend pane-pid lookup, so correctness demands per-lookup
+ * causal attribution: the zellij-socket-probe child connects to the socket
+ * FILE and identifies which candidate server pid accept()ed that specific
+ * connection (see its header for the protocol). No file → session gone →
+ * null. Ambiguity → one retry → null (宁缺勿错).
+ *
+ * Non-Linux keeps the legacy argv-tail match (no /proc to attribute with);
+ * the daemon runs on Linux, and renamed/reused names were never supported
+ * there.
+ */
 export function findServerPid(sessionName: string): number | null {
+  let servers: ZellijServerProc[];
   try {
     const out = execFileSync('ps', ['-eo', 'pid=,args='], {
       encoding: 'utf-8',
@@ -385,15 +417,45 @@ export function findServerPid(sessionName: string): number | null {
       timeout: 3000,
       env: zellijEnv(),
     });
-    for (const line of out.split('\n')) {
-      const m = line.trim().match(/^(\d+)\s+(.*)$/);
-      if (!m) continue;
-      const argv = m[2]!;
-      if (/zellij\b.*--server\b/.test(argv) && new RegExp(`/${escapeRe(sessionName)}$`).test(argv.trim())) {
-        return Number(m[1]);
+    servers = parseZellijServerProcs(out);
+  } catch { return null; /* ps unavailable */ }
+  if (servers.length === 0) return null;
+
+  if (process.platform !== 'linux') {
+    const suffix = new RegExp(`/${escapeRe(sessionName)}$`);
+    return servers.find(s => suffix.test(s.socketPath))?.pid ?? null;
+  }
+
+  const probeScript = fileURLToPath(new URL('./zellij-socket-probe.js', import.meta.url));
+  for (const dir of [...new Set(servers.map(s => dirname(s.socketPath)))]) {
+    const sock = join(dir, sessionName);
+    if (!existsSync(sock)) continue;
+    const candidates = servers.filter(s => dirname(s.socketPath) === dir);
+    // A single probe run can in principle still be spoofed by a pathological
+    // coincidence (target's accepts invisible in the window while ≥2 short
+    // sibling connections straddle it — Codex delta finding), so a success is
+    // only trusted once an INDEPENDENT second run attributes the same pid.
+    // Ambiguity (exit 3) is retryable — a concurrent zellij client can race
+    // one window, but the same pattern across disjoint windows is not a
+    // plausible accident. Hard failures (connect refused etc.) abort.
+    const agreed: number[] = [];
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const r = spawnSync(process.execPath, [probeScript, sock, ...candidates.map(c => String(c.pid))], {
+        encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 8000,
+      });
+      if (r.status === 0) {
+        const pid = Number((r.stdout ?? '').trim());
+        if (!candidates.some(c => c.pid === pid)) break;
+        agreed.push(pid);
+        if (agreed.length === 2) {
+          if (agreed[0] === agreed[1]) return pid;
+          break; // two successes disagree → something is racing us → null
+        }
+        continue; // first success — run the confirmation probe
       }
+      if (r.status !== 3) break;
     }
-  } catch { /* ps unavailable */ }
+  }
   return null;
 }
 

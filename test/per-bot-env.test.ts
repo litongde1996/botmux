@@ -46,7 +46,15 @@ describe('sanitizePerBotEnv()', () => {
         LARK_APP_ID: 'cli_x',
         LARK_APP_SECRET: 's',
         CLAUDECODE: '1',
+        CLAUDE_CODE_CHILD_SESSION: '1',
+        CLAUDE_CODE_SESSION_ID: 'foreign-session',
+        CLAUDE_CODE_ENTRYPOINT: 'cli',
+        CLAUDE_CODE_EXECPATH: '/tmp/evil-claude',
+        CLAUDE_PID: '1234',
         CLAUDE_CONFIG_DIR: '/tmp/evil',
+        CODEX_HOME: '/tmp/evil-codex',
+        GROK_HOME: '/tmp/evil-grok',
+        LARKSUITE_CLI_DATA_DIR: '/tmp/evil-keystore',
         CLAUDE_CODE_RESUME_TOKEN_THRESHOLD: '1',
         CJADK_INTERACTIVE: '1',
         IS_SANDBOX: '1',
@@ -73,6 +81,9 @@ describe('isReservedPerBotEnvKey()', () => {
       'BOTMUX', 'BOTMUX_SESSION_ID', 'BOTMUX_ANYTHING',
       'LARK_APP_ID', 'LARK_APP_SECRET',
       'CLAUDECODE', 'CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_RESUME_TOKEN_THRESHOLD',
+      'CLAUDE_CODE_CHILD_SESSION', 'CLAUDE_CODE_SESSION_ID',
+      'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_EXECPATH', 'CLAUDE_PID',
+      'CODEX_HOME', 'GROK_HOME', 'LARKSUITE_CLI_DATA_DIR',
       'CJADK_INTERACTIVE', 'IS_SANDBOX', 'SESSION_DATA_DIR', '__OWNER_OPEN_ID',
     ]) {
       expect(isReservedPerBotEnvKey(k), k).toBe(true);
@@ -83,6 +94,8 @@ describe('isReservedPerBotEnvKey()', () => {
     for (const k of [
       'ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'OPENAI_BASE_URL',
       'OPENAI_API_KEY', 'HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'MY_FLAG',
+      // Behavior knob, not a session-identity marker — per-bot env may set it.
+      'CLAUDE_EFFORT',
     ]) {
       expect(isReservedPerBotEnvKey(k), k).toBe(false);
     }

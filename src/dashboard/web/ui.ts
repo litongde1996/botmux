@@ -1,4 +1,8 @@
 import {
+  fetchGroupsSnapshot,
+} from './groups-api.js';
+
+import {
   DASHBOARD_LOCALE_STORAGE_KEY,
   createDashboardTranslator,
   readStoredDashboardLocale,
@@ -15,7 +19,11 @@ import {
   type SkinId,
 } from './preferences.js';
 import { applyCyberFx } from './cyber-fx.js';
-import { playSkinIntro } from './skin-intro.js';
+import {
+  NO_WORKBENCH_CAPABILITIES,
+  type WorkbenchCapabilities,
+} from './agent-workbench-capabilities.js';
+import { larkHosts, normalizeBrand } from '../../im/lark/lark-hosts.js';
 
 type UiListener = () => void;
 
@@ -24,12 +32,25 @@ class DashboardUiState {
   themeMode: ThemeMode = 'system';
   resolvedTheme: ResolvedTheme = 'light';
   skin: SkinId = 'default';
-  // Dashboard cookie-auth state, mirrored from /api/settings by app.ts's
+  // Dashboard cookie-auth state, mirrored from /api/settings by app.tsx's
   // loadAuthState(). Gates write-only affordances rendered per-row (e.g. the
   // writable-terminal "🔑" segment in the sessions board) — read-only visitors
   // must not see a control whose endpoint they'd 401 on. Defaults true so a
   // transient probe failure never hides it from a real token holder.
   authed = true;
+  // A legacy owner, H5 session, or platform-dashboard identity may operate the
+  // narrow Workbench capability set. Keep this separate from `authed`: the
+  // latter alone controls host-management affordances across the rest of the
+  // Dashboard.
+  workbenchAuthed = true;
+  // P1-4：服务端投影的最小操作能力集（GET /api/workbench/capabilities，由
+  // app.tsx 的 loadAuthState 严格解析后写入）。与 workbenchAuthed 相反，它默认
+  // fail-closed 全 false：workbenchAuthed 只证明可进工作台，三类操作入口（定位/
+  // 终端接管/Preview 交互）各自只看对应布尔，绝不回落 true。
+  workbenchCapabilities: WorkbenchCapabilities = NO_WORKBENCH_CAPABILITIES;
+  // Effective dashboard sharing policy. When enabled, tokenless visitors may
+  // read allow-listed dashboard data; it does not downgrade authenticated users.
+  publicReadOnly = false;
   private listeners = new Set<UiListener>();
   private translate = createDashboardTranslator(this.locale);
   private mediaQuery: MediaQueryList | null = null;
@@ -111,10 +132,6 @@ class DashboardUiState {
   private applySkin(animate = false): void {
     document.documentElement.dataset.skin = this.skin;
     applyCyberFx(this.skin === 'cyber', animate);
-    // 2077 plays its own boot loader; the other skins get a themed switch-in intro.
-    if (animate && this.skin !== 'cyber' && this.skin !== 'default') {
-      playSkinIntro(this.skin);
-    }
   }
 
   private applyLocale(): void {
@@ -126,13 +143,7 @@ class DashboardUiState {
 const SKIN_THEME: Record<SkinId, ResolvedTheme> = {
   default: 'light',
   cyber: 'dark',
-  genshin: 'light',
   fallout: 'dark',
-  prts: 'dark',
-  bluearchive: 'dark',
-  zzz: 'dark',
-  dragonball: 'light',
-  ikun: 'dark',
 };
 
 function navigatorLanguages(): readonly string[] {
@@ -191,6 +202,19 @@ const botAvatarByName = new Map<string, string>();
 export function botAvatarUrlFor(name?: string, larkAppId?: string): string | undefined {
   if (larkAppId) return botAvatarByAppId.get(larkAppId);
   return name ? botAvatarByName.get(String(name)) : undefined;
+}
+
+/** 该 bot 在飞书/Lark 开放平台的应用后台深链。larkAppId 即开放平台 AppID
+ *  （cli_xxx），host 必须按 bot 的 brand 派生:feishu 租户走 open.feishu.cn、
+ *  国际版 lark 租户走 open.larksuite.com——两者是**独立平台上的独立应用**
+ *  （AppID 各自独立、登录域不同），拿 feishu host 打开 lark 应用后台不通，
+ *  反之亦然。brand 缺省 / 非法值经 normalizeBrand 归一为 feishu，向后兼容
+ *  旧 payload。非 cli_ 前缀（首屏聚合未回来时的占位键、按名聚合的历史卡、
+ *  headless 的 local_ 身份）返回 null，避免拼出无效地址。 */
+export function larkConsoleUrl(larkAppId?: string, brand?: string): string | null {
+  return larkAppId && larkAppId.startsWith('cli_')
+    ? `${larkHosts(normalizeBrand(brand)).openApi}/app/${encodeURIComponent(larkAppId)}`
+    : null;
 }
 
 export interface BotAvatarOpts {
@@ -299,12 +323,20 @@ function persistAvatarCache(): void {
 
 hydrateAvatarCache(); // 模块加载即回灌，先于任何页面渲染
 
+/** Bot 改头像成功后本地即时生效：更新内存映射 + localStorage 缓存，让所有
+ *  渲染点（配置页 / 会话行 / 总览）下一次重绘就用新图，不必等 /api/groups
+ *  的注册表数据收敛。 */
+export function overrideBotAvatar(larkAppId: string, name: string | undefined, url: string): void {
+  if (!larkAppId || !url) return;
+  botAvatarByAppId.set(larkAppId, url);
+  if (name) botAvatarByName.set(String(name), url);
+  persistAvatarCache();
+}
+
 export function loadNameMaps(): Promise<void> {
   nameMapsPromise ??= (async () => {
     try {
-      const r = await fetch('/api/groups');
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      const data = await r.json();
+      const data = await fetchGroupsSnapshot();
       for (const b of data.bots ?? []) {
         if (b.larkAppId && b.botName && b.botName !== b.larkAppId) {
           botNameByAppId.set(b.larkAppId, String(b.botName));
@@ -341,8 +373,10 @@ export function botDisplayName(s: Record<string, any>): string {
   return String(s.botName ?? s.larkAppId ?? '-');
 }
 
-/** 会话所在群聊的标题；单聊或群列表里查不到时返回 null（由调用方回退）。 */
+/** 会话所在聊天的标题；p2p 优先使用后端行上的直聊显示名，群聊走 /api/groups 名字表。 */
 export function chatDisplayTitle(s: Record<string, any>): string | null {
+  const rowName = String(s.chatDisplayName ?? '').trim();
+  if (rowName) return rowName;
   return (s.chatId && chatNameById.get(s.chatId)) || null;
 }
 
@@ -354,11 +388,6 @@ export function stripMentionPrefix(title: unknown): string {
   return out || raw;
 }
 
-/** 全站统一的页面级 loading 占位（慢接口在途时先渲染这个，避免白屏假死）。 */
-export function loadingHtml(label?: string): string {
-  return `<div class="page-loading" role="status"><i class="page-loading-spin" aria-hidden="true"></i>${escapeHtml(label ?? t('common.loading'))}</div>`;
-}
-
 /** 会话当前是否卡在等人，以及等什么（全局 strip 和工作台共用同一判定）。 */
 export function attentionReason(s: Record<string, any>): string | null {
   if (s.status === 'closed') return null;
@@ -367,6 +396,7 @@ export function attentionReason(s: Record<string, any>): string | null {
   if (s.pendingRepo) return t('sessions.board.signalRepo');
   if (s.tuiPromptActive) return t('sessions.board.signalPrompt');
   if (s.status === 'limited') return t('sessions.board.signalLimited');
+  if (s.status === 'stalled') return t('sessions.board.signalStalled');
   return null;
 }
 

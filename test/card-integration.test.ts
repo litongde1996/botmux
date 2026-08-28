@@ -19,6 +19,7 @@
  *
  * Run:  pnpm vitest run test/card-integration.test.ts
  */
+import { EventEmitter } from 'node:events';
 import { describe, it, expect, beforeEach, vi, type Mock } from 'vitest';
 import { FakeLarkClient } from './fixtures/fake-lark-client.js';
 import {
@@ -104,6 +105,7 @@ vi.mock('../src/bot-registry.js', () => ({
   })),
   getAllBots: vi.fn(() => []),
   getBotClient: vi.fn(),
+  getBotBrand: vi.fn(() => 'feishu'),
 }));
 
 vi.mock('../src/config.js', () => ({
@@ -115,9 +117,13 @@ vi.mock('../src/config.js', () => ({
 }));
 
 vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
   closeSession: vi.fn(),
   updateSession: vi.fn(),
   createSession: vi.fn(),
+  getOwnedSession: vi.fn(),
   // Resume action's permission gate falls back to a store lookup when the
   // session is no longer in activeSessions. Tests override the implementation
   // per-scenario via vi.mocked(getSession).mockReturnValueOnce(...).
@@ -128,9 +134,14 @@ vi.mock('../src/core/worker-pool.js', async (importOriginal) => {
   const orig = await importOriginal<typeof import('../src/core/worker-pool.js')>();
   return {
     ...orig,
+    closeSession: vi.fn((sessionId: string) => orig.closeSession(sessionId)),
     forkWorker: vi.fn(),
     killWorker: vi.fn(),
     initWorkerPool: vi.fn(),
+    requestSessionRestart: vi.fn((_ds: any, observer: any) => {
+      void observer.notify('in_progress');
+      return { attemptId: 'attempt-card', joined: false };
+    }),
   };
 });
 
@@ -162,11 +173,18 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 // ─── Imports ──────────────────────────────────────────────────────────────
 
 import { handleCardAction, type CardHandlerDeps } from '../src/im/lark/card-handler.js';
-import { scheduleCardPatch } from '../src/core/worker-pool.js';
-import { killWorker, forkWorker } from '../src/core/worker-pool.js';
-import { sessionKey } from '../src/core/types.js';
+import {
+  closeSession as closeWorkerSession,
+  scheduleCardPatch,
+  setActiveSessionsRegistry,
+  forkWorker,
+  requestSessionRestart,
+} from '../src/core/worker-pool.js';
+import { activeSessionKey, sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { buildStreamingCard } from '../src/im/lark/card-builder.js';
+import * as sessionStore from '../src/services/session-store.js';
+import { ZmxBackend } from '../src/adapters/backend/zmx-backend.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -176,6 +194,23 @@ const NONCE_CURRENT = 'nonce_abc1';
 const NONCE_OLD = 'nonce_old_xyz';
 
 function makeDaemonSession(overrides?: Partial<DaemonSession>): DaemonSession {
+  const worker = Object.assign(new EventEmitter(), {
+    killed: false,
+    send: vi.fn(),
+    kill: vi.fn(),
+    exitCode: null as number | null,
+    signalCode: null as NodeJS.Signals | null,
+  });
+  worker.send.mockImplementation((message: { type?: string }) => {
+    if (message.type === 'close') {
+      queueMicrotask(() => {
+        worker.exitCode = 0;
+        worker.emit('exit', 0, null);
+      });
+    }
+    return true;
+  });
+
   return {
     session: {
       sessionId: 'uuid-integ-test',
@@ -189,7 +224,7 @@ function makeDaemonSession(overrides?: Partial<DaemonSession>): DaemonSession {
       chatType: 'group',
       scope: 'chat',
     },
-    worker: { killed: false, send: vi.fn() } as any,
+    worker: worker as any,
     workerPort: 8080,
     workerToken: 'tok_secret',
     larkAppId: APP_ID,
@@ -214,6 +249,13 @@ function makeDaemonSession(overrides?: Partial<DaemonSession>): DaemonSession {
 
 function makeDeps(activeSessions: Map<string, DaemonSession>): CardHandlerDeps {
   sessionReplyCallIndex = 0;
+  // Card actions and worker-pool closeSession share this exact registry in
+  // production. Model that identity here so close teardown mutates the same
+  // object the card handler subsequently removes.
+  setActiveSessionsRegistry(activeSessions);
+  vi.mocked(sessionStore.getOwnedSession).mockImplementation((sessionId: string) =>
+    [...activeSessions.values()].find(ds => ds.session.sessionId === sessionId)?.session,
+  );
   return {
     activeSessions,
     sessionReply: vi.fn(async () => {
@@ -471,11 +513,36 @@ describe('Card integration: full event flow', () => {
 
       await handleCardAction(makeRestartEvent(ROOT_ID), deps, APP_ID);
 
-      expect(workerSend).toHaveBeenCalledWith({ type: 'restart' });
+      expect(requestSessionRestart).toHaveBeenCalledWith(ds, expect.objectContaining({ source: 'card' }));
       // The confirmation is delivered ephemeral to the clicker (group chat + an
       // operator open_id), not as a visible group reply.
       expect(vi.mocked(clientMod.sendEphemeralCard)).toHaveBeenCalledWith(
         APP_ID, ds.chatId, 'ou_user', expect.stringContaining('重启'),
+      );
+      expect(deps.sessionReply).not.toHaveBeenCalled();
+    });
+
+    it('restart from a stale Riff card should explain close-and-recreate without IPC', async () => {
+      const clientMod = await import('../src/im/lark/client.js');
+      const workerSend = vi.fn();
+      const ds = makeDaemonSession({
+        worker: { killed: false, send: workerSend } as any,
+      });
+      ds.session.cliId = 'riff';
+      ds.session.backendType = 'riff';
+      const sessions = new Map<string, DaemonSession>();
+      sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
+      const deps = makeDeps(sessions);
+
+      await handleCardAction(makeRestartEvent(ROOT_ID), deps, APP_ID);
+
+      expect(workerSend).not.toHaveBeenCalled();
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(vi.mocked(clientMod.sendEphemeralCard)).toHaveBeenCalledWith(
+        APP_ID,
+        ds.chatId,
+        'ou_user',
+        expect.stringMatching(/Riff.*不支持重启.*\/close/),
       );
       expect(deps.sessionReply).not.toHaveBeenCalled();
     });
@@ -488,20 +555,24 @@ describe('Card integration: full event flow', () => {
 
       await handleCardAction(makeRestartEvent(ROOT_ID), deps, APP_ID);
 
-      expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
+      expect(requestSessionRestart).toHaveBeenCalledWith(ds, expect.objectContaining({ source: 'card' }));
     });
 
-    it('close should kill worker and remove session', async () => {
+    it('close should remove session and deliver the closed card', async () => {
       const clientMod = await import('../src/im/lark/client.js');
       const ds = makeDaemonSession();
       const sessions = new Map<string, DaemonSession>();
-      const sKey = sessionKey(ROOT_ID, APP_ID);
+      const sKey = activeSessionKey(ds);
       sessions.set(sKey, ds);
       const deps = makeDeps(sessions);
 
-      await handleCardAction(makeCloseEvent(ROOT_ID), deps, APP_ID);
+      await handleCardAction(makeCloseEvent(ROOT_ID, 'ou_user', undefined, ds.session.sessionId), deps, APP_ID);
 
-      expect(killWorker).toHaveBeenCalledWith(ds);
+      expect(sessionStore.closeSession).toHaveBeenCalledWith(
+        ds.session.sessionId,
+        { cleanupBridgeMarkers: false },
+      );
+      expect(ds.session.status).toBe('closed');
       expect(sessions.has(sKey)).toBe(false);
       // Closed reply is an interactive card with a Resume button, delivered
       // ephemeral to the clicker (group chat + operator open_id); the mocked
@@ -509,6 +580,126 @@ describe('Card integration: full event flow', () => {
       expect(vi.mocked(clientMod.sendEphemeralCard)).toHaveBeenCalledWith(
         APP_ID, ds.chatId, 'ou_user', expect.stringContaining('"type":"closed"'),
       );
+      expect(deps.sessionReply).not.toHaveBeenCalled();
+    });
+
+    it('keeps a ZMX session active and returns a warning when verified teardown is refused', async () => {
+      const clientMod = await import('../src/im/lark/client.js');
+      const ds = makeDaemonSession();
+      ds.session.backendType = 'zmx';
+      ds.initConfig = { backendType: 'zmx' } as DaemonSession['initConfig'];
+      const workerSend = ds.worker!.send as Mock;
+      const sessions = new Map<string, DaemonSession>();
+      const sKey = sessionKey(ROOT_ID, APP_ID);
+      sessions.set(sKey, ds);
+      const deps = makeDeps(sessions);
+      const kill = vi.spyOn(ZmxBackend, 'killManagedSession')
+        .mockImplementationOnce(() => { throw new Error('ownership probe unavailable'); });
+
+      try {
+        const result = await handleCardAction(makeCloseEvent(ROOT_ID), deps, APP_ID);
+
+        expect(kill).toHaveBeenCalledWith('bmx-uuid-int', ds.session.sessionId);
+        expect(result?.toast).toEqual(expect.objectContaining({
+          type: 'warning',
+          content: expect.stringContaining('ownership probe unavailable'),
+        }));
+        expect(sessions.get(sKey)).toBe(ds);
+        expect(ds.session.status).toBe('active');
+        expect(ds.worker).not.toBeNull();
+        expect(workerSend).not.toHaveBeenCalled();
+        expect(sessionStore.closeSession).not.toHaveBeenCalled();
+        expect(vi.mocked(clientMod.sendEphemeralCard)).not.toHaveBeenCalled();
+        expect(deps.sessionReply).not.toHaveBeenCalled();
+      } finally {
+        kill.mockRestore();
+      }
+    });
+
+    it('close reports a residual instead of the ordinary closed card', async () => {
+      // The row DID close, so this is not a failure — but a remote session was
+      // deliberately left running (quarantined lineage cannot be cancelled safely).
+      // Sending the normal closed card here would tell the user it is all gone.
+      const clientMod = await import('../src/im/lark/client.js');
+      const ds = makeDaemonSession();
+      const sessions = new Map<string, DaemonSession>();
+      sessions.set(activeSessionKey(ds), ds);
+      const deps = makeDeps(sessions);
+      vi.mocked(closeWorkerSession).mockResolvedValueOnce({
+        ok: true,
+        outcome: 'closed_with_residual',
+        residual: { reason: 'mojo_lineage_quarantined', taskId: 'mojo-parked-9' },
+        alreadyClosed: false,
+        known: true,
+      } as never);
+
+      const result = await handleCardAction(
+        makeCloseEvent(ROOT_ID, 'ou_user', undefined, ds.session.sessionId),
+        deps,
+        APP_ID,
+      );
+
+      expect(result?.toast).toEqual(expect.objectContaining({
+        type: 'warning',
+        content: expect.stringContaining('mojo-parked-9'),
+      }));
+      expect(result?.toast?.content).toContain('未被取消');
+      // No ordinary "closed" card on either delivery path.
+      expect(vi.mocked(clientMod.sendEphemeralCard)).not.toHaveBeenCalled();
+      expect(deps.sessionReply).not.toHaveBeenCalled();
+    });
+
+    it('a LOCAL-subtree residual close toast points at the host process, not a phantom remote (round-11 P1-2)', async () => {
+      const ds = makeDaemonSession();
+      const sessions = new Map<string, DaemonSession>();
+      sessions.set(activeSessionKey(ds), ds);
+      const deps = makeDeps(sessions);
+      vi.mocked(closeWorkerSession).mockResolvedValueOnce({
+        ok: true,
+        outcome: 'closed_with_residual',
+        residual: { reason: 'local_subtree_boundary_unproven' }, // no taskId
+        alreadyClosed: false,
+        known: true,
+      } as never);
+
+      const result = await handleCardAction(
+        makeCloseEvent(ROOT_ID, 'ou_user', undefined, ds.session.sessionId),
+        deps,
+        APP_ID,
+      );
+
+      expect(result?.toast?.type).toBe('warning');
+      expect(result?.toast?.content).toContain('本机');
+      expect(result?.toast?.content).not.toContain('undefined');
+      expect(result?.toast?.content).not.toMatch(/远端会话.*未.*取消/);
+    });
+
+    it('close refusal reports the remote id and does not send a closed card', async () => {
+      const clientMod = await import('../src/im/lark/client.js');
+      const ds = makeDaemonSession();
+      const sessions = new Map<string, DaemonSession>();
+      sessions.set(activeSessionKey(ds), ds);
+      const deps = makeDeps(sessions);
+      vi.mocked(closeWorkerSession).mockResolvedValueOnce({
+        ok: false,
+        alreadyClosed: false,
+        error: 'mojo_close_reconciliation_required',
+        retryable: true,
+        taskId: 'mojo-uncertain-9',
+      } as never);
+
+      const result = await handleCardAction(
+        makeCloseEvent(ROOT_ID, 'ou_user', undefined, ds.session.sessionId),
+        deps,
+        APP_ID,
+      );
+
+      expect(result?.toast).toEqual(expect.objectContaining({
+        type: 'warning',
+        content: expect.stringContaining('mojo-uncertain-9'),
+      }));
+      expect(result?.toast?.content).toContain('mojo_close_reconciliation_required');
+      expect(vi.mocked(clientMod.sendEphemeralCard)).not.toHaveBeenCalled();
       expect(deps.sessionReply).not.toHaveBeenCalled();
     });
 
@@ -525,13 +716,21 @@ describe('Card integration: full event flow', () => {
       try {
         const ds = makeDaemonSession();
         const sessions = new Map<string, DaemonSession>();
-        const sKey = sessionKey(ROOT_ID, APP_ID);
+        const sKey = activeSessionKey(ds);
         sessions.set(sKey, ds);
         const deps = makeDeps(sessions);
 
-        await handleCardAction(makeCloseEvent(ROOT_ID, 'ou_owner'), deps, APP_ID);
+        await handleCardAction(
+          makeCloseEvent(ROOT_ID, 'ou_owner', undefined, ds.session.sessionId),
+          deps,
+          APP_ID,
+        );
 
-        expect(killWorker).toHaveBeenCalledWith(ds);
+        expect(sessionStore.closeSession).toHaveBeenCalledWith(
+          ds.session.sessionId,
+          { cleanupBridgeMarkers: false },
+        );
+        expect(ds.session.status).toBe('closed');
         expect(sessions.has(sKey)).toBe(false);
         // Closed card goes ephemeral to the owner …
         expect(vi.mocked(clientMod.sendEphemeralCard)).toHaveBeenCalledWith(
@@ -566,13 +765,21 @@ describe('Card integration: full event flow', () => {
       try {
         const ds = makeDaemonSession();
         const sessions = new Map<string, DaemonSession>();
-        const sKey = sessionKey(ROOT_ID, APP_ID);
+        const sKey = activeSessionKey(ds);
         sessions.set(sKey, ds);
         const deps = makeDeps(sessions);
 
-        await handleCardAction(makeCloseEvent(ROOT_ID, 'ou_owner', 'private'), deps, APP_ID);
+        await handleCardAction(
+          makeCloseEvent(ROOT_ID, 'ou_owner', 'private', ds.session.sessionId),
+          deps,
+          APP_ID,
+        );
 
-        expect(killWorker).toHaveBeenCalledWith(ds);
+        expect(sessionStore.closeSession).toHaveBeenCalledWith(
+          ds.session.sessionId,
+          { cleanupBridgeMarkers: false },
+        );
+        expect(ds.session.status).toBe('closed');
         // Closed card still goes ephemeral to the owner …
         expect(vi.mocked(clientMod.sendEphemeralCard)).toHaveBeenCalledWith(
           APP_ID, ds.chatId, 'ou_owner', expect.stringContaining('"type":"closed"'),
@@ -706,6 +913,34 @@ describe('Card integration: full event flow', () => {
       expect(sm.resumeSession).not.toHaveBeenCalled();
     });
 
+    it('sensitive fallback should reject when only p2pOpen is configured', async () => {
+      // 回归（codex 复验）：p2pOpen 与 globalGrants 同理——它也是一次显式的权限边界声明，
+      // 这条手写 fallback 必须把它算进 hasAllowlist，否则「只配 p2pOpen、无 allowedUsers」的
+      // 部署会让敏感卡片动作 fall through 成全开放（p2pOpen 只该开私聊 talk，绝不给 operate）。
+      const botRegMod = await import('../src/bot-registry.js');
+      vi.mocked(botRegMod.getAllBots).mockReturnValueOnce([{
+        config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', p2pOpen: true } as any,
+        resolvedAllowedUsers: [],
+        botOpenId: 'ou_bot',
+      } as any]);
+
+      const sessionId = 'closed-uuid-fallback-p2popen';
+      const sessions = new Map<string, DaemonSession>();
+      const deps = makeDeps(sessions);
+
+      const sessionStoreMod = await import('../src/services/session-store.js');
+      vi.mocked(sessionStoreMod.getSession).mockReturnValue({
+        sessionId, chatId: 'oc_chat', rootMessageId: ROOT_ID,
+        title: 'closed', status: 'closed', createdAt: '2026-01-01T00:00:00.000Z',
+        scope: 'thread',
+      } as any);
+      const sm = await import('../src/core/session-manager.js');
+
+      await handleCardAction(makeResumeEvent(ROOT_ID, sessionId, 'ou_user'), deps, undefined);
+
+      expect(sm.resumeSession).not.toHaveBeenCalled();
+    });
+
     it('resume should reject when operator is not in allowedUsers', async () => {
       // canOperate is gated through bot-registry.getBot(...).resolvedAllowedUsers
       // — switch the mock to a bot with a non-empty allowlist that excludes the
@@ -760,7 +995,7 @@ describe('Card integration: full event flow', () => {
 
       await handleCardAction(makeRestartEvent(ROOT_ID), deps, APP_ID);
 
-      expect(workerSend).toHaveBeenCalledWith({ type: 'restart' });
+      expect(requestSessionRestart).toHaveBeenCalledWith(ds, expect.objectContaining({ source: 'card' }));
       expect(vi.mocked(clientMod.sendEphemeralCard)).not.toHaveBeenCalled();
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID, expect.stringContaining('重启'), undefined, APP_ID,
@@ -771,18 +1006,62 @@ describe('Card integration: full event flow', () => {
       const clientMod = await import('../src/im/lark/client.js');
       const ds = makeDaemonSession({ scope: 'thread' });
       const sessions = new Map<string, DaemonSession>();
-      const sKey = sessionKey(ROOT_ID, APP_ID);
+      const sKey = activeSessionKey(ds);
       sessions.set(sKey, ds);
       const deps = makeDeps(sessions);
 
       await handleCardAction(makeCloseEvent(ROOT_ID), deps, APP_ID);
 
-      expect(killWorker).toHaveBeenCalledWith(ds);
+      expect(sessionStore.closeSession).toHaveBeenCalledWith(
+        ds.session.sessionId,
+        { cleanupBridgeMarkers: false },
+      );
+      expect(ds.session.status).toBe('closed');
       expect(sessions.has(sKey)).toBe(false);
       expect(vi.mocked(clientMod.sendEphemeralCard)).not.toHaveBeenCalled();
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID, expect.stringContaining('"type":"closed"'), 'interactive', APP_ID,
       );
+    });
+
+    it('does not delete a replacement session that wins the route while close cleanup awaits', async () => {
+      const ds = makeDaemonSession({ scope: 'thread' });
+      const replacement = makeDaemonSession({
+        session: {
+          ...ds.session,
+          sessionId: 'uuid-replacement-after-close',
+          status: 'active' as any,
+        },
+      });
+      const sessions = new Map<string, DaemonSession>();
+      const sKey = sessionKey(ROOT_ID, APP_ID);
+      sessions.set(sKey, ds);
+      const deps = makeDeps(sessions);
+      let signalCloseStarted!: () => void;
+      const closeStarted = new Promise<void>((resolve) => {
+        signalCloseStarted = resolve;
+      });
+      let releaseClose!: () => void;
+      const closeCleanupPending = new Promise<void>((resolve) => {
+        releaseClose = resolve;
+      });
+      vi.mocked(closeWorkerSession).mockImplementationOnce(async () => {
+        // Production closeSession removes and closes the captured ds before its
+        // first network-cleanup await. A new session may then claim the key.
+        sessions.delete(sKey);
+        ds.session.status = 'closed';
+        signalCloseStarted();
+        await closeCleanupPending;
+        return { ok: true, outcome: 'closed', alreadyClosed: false, known: true };
+      });
+
+      const closeAction = handleCardAction(makeCloseEvent(ROOT_ID), deps, APP_ID);
+      await closeStarted;
+      sessions.set(sKey, replacement);
+      releaseClose();
+      await closeAction;
+
+      expect(sessions.get(sKey)).toBe(replacement);
     });
 
     it('resume notice in a thread-scope session is replied in-thread, never ephemeral', async () => {
@@ -891,6 +1170,32 @@ describe('Card integration: full event flow', () => {
         APP_ID, ds.chatId, 'ou_user', expect.stringContaining('尚未就绪'),
       );
       expect(deps.sessionReply).not.toHaveBeenCalled();
+    });
+
+    it('reports Web Terminal as unsupported for stale ZMX cards even if old terminal state remains', async () => {
+      const clientMod = await import('../src/im/lark/client.js');
+      const ds = makeDaemonSession({
+        session: {
+          ...makeDaemonSession().session,
+          backendType: 'zmx',
+          webPort: 9090,
+        },
+        workerPort: 9090,
+        workerToken: 'stale-write-token',
+        riffAccessUrl: 'https://stale-riff.example',
+      });
+      const sessions = new Map<string, DaemonSession>();
+      sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
+      const deps = makeDeps(sessions);
+
+      const res = await handleCardAction(makeGetWriteLinkEvent(ROOT_ID, 'ou_user'), deps, APP_ID);
+
+      expect(res?.toast?.type).not.toBe('success');
+      expect(fakeLark.dms).toHaveLength(0);
+      expect(vi.mocked(clientMod.sendEphemeralCard)).toHaveBeenCalledWith(
+        APP_ID, ds.chatId, 'ou_user', expect.stringContaining('不提供 Web 终端'),
+      );
+      expect(vi.mocked(clientMod.sendEphemeralCard).mock.calls.at(-1)?.[3]).not.toContain('尚未就绪');
     });
   });
 
@@ -1109,6 +1414,7 @@ describe('Card integration: full event flow', () => {
       // sessionReply was used to surface the rejection message.
       expect(deps.sessionReply).toHaveBeenCalled();
     });
+
   });
 
   describe('Scenario 8: usage-limit retry action', () => {

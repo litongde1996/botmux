@@ -1,12 +1,16 @@
 # 下一代 workflow：LLM-driven DAG + 文件系统 IPC（设计 brief）
 
+> **历史设计快照，已被 2026-07 的 Workflow v3 落地与 v2 退役方案取代。**
+> 下文关于 v0.2/v3 双 runtime 长期共存的建议不再是当前产品口径；v2 runtime
+> 已下线，只保留 `migrate-v3` / `archive-runs` 离线迁移与审计工具。
+
 - 日期：2026-06-01
-- 状态：**v2 — codex review 已合入，待老滕 grill**
+- 状态：**v2 — codex review 已合入，待用户 grill**
 - 工作模式：md-first（暂不上飞书文档，本机 md 做 codex review 载体）
 - 关联：v0.2 schema-driven workflow（已发版 v2.36.0，PR #47）
 - 评审：codex-loopy 已 review v1（5 条意见 + 逐 Q 投票 + §7 默认建议），结论见 §0.5
 
-## 0. 老滕原话（不改写）
+## 0. 用户原话（不改写）
 
 > 现在打算在 botmux 上做下一代 workflow 不依托固定流程, 由 llm 来决策流程. 问题描述/需求澄清阶段用 grill-me（在 github 上找一下）这个 skill 的流程来做需求分析, 然后根据分析出来的任务拆解来设计工作流, 流程调度走 dag 的模式来实现并发执行, 然后每个 sub agent 执行任务都需要用/goal 命令来一步到位 然后 dag 流程中的上下文传递通过文件系统完成 写文件 透传文件地址到下一个流程这样 dag 流程的保证也通过 file 来处理
 
@@ -54,7 +58,7 @@ codex 整体同意三层拆分（grill/spec → architect/dag → runtime）和�
 3. 决策树沿分支走，先父决策再子决策
 4. 能从代码查到的不要问，直接 explore
 
-**应用：** 我和 codex 把"下一代 workflow"的决策树画出来，每个分支给推荐答案，老滕 review 时按分支顺序逐个推翻或确认。
+**应用：** 我和 codex 把"下一代 workflow"的决策树画出来，每个分支给推荐答案，用户 review 时按分支顺序逐个推翻或确认。
 
 **grill「够了」的判定标准（codex 建议，已采纳）：** 拷问到能为每个节点产出 `goal / inputs / expected outputs / acceptance criteria / risk gates` 五件套，否则继续问。
 
@@ -104,7 +108,7 @@ codex 整体同意三层拆分（grill/spec → architect/dag → runtime）和�
 ┌─────────────────────────────────────────────────────────────┐
 │ Layer B: architect bot（可以是同一个 bot 换角色）            │
 │   - 读 spec.md 合成 dag.json（节点 / 边 / humanGate 标记）  │
-│   - 老滕 review dag.json → 批准 / 重 grill                   │
+│   - 用户 review dag.json → 批准 / 重 grill                   │
 └──────────────────────┬──────────────────────────────────────┘
                        │ dag.json
                        ▼
@@ -178,7 +182,7 @@ $RUN_DIR/<runId>/
 
 ## 5. OPEN QUESTIONS（grill-me 决策树）—— 每题带 [codex 投票] + v2 推荐答案
 
-按依赖排序，老滕逐个 review：
+按依赖排序，用户逐个 review：
 
 ### Q1（根节点）：定位 — 替代还是并行？ [codex: 同意并行]
 
@@ -187,7 +191,7 @@ $RUN_DIR/<runId>/
 
 ### Q2：grill 阶段产物形态 [codex: 同意 spec.md，须含验收标准+非目标]
 
-- **v2 推荐：** `spec.md`（人类可读 markdown，含决策树 + 每分支结论 + 拒绝的备选 + **验收标准** + **非目标**）。不直接产 DAG，让 architect 阶段翻译，给老滕一次 review 机会。
+- **v2 推荐：** `spec.md`（人类可读 markdown，含决策树 + 每分支结论 + 拒绝的备选 + **验收标准** + **非目标**）。不直接产 DAG，让 architect 阶段翻译，给用户一次 review 机会。
 - 备选（已否）：grill 完直接产 dag.json —— 一次合成 spec+DAG 容错差。
 
 ### Q3：DAG 静态还是动态 [codex: 同意 static，expand 只 deferred]
@@ -287,7 +291,7 @@ $RUN_DIR/<runId>/
 4. ~~file IPC contract（Q8/Q9）~~ → manifest schema 收紧；state 改 journal+checkpoint
 5. ~~MVP scope（Q12）~~ → 共识达成，humanGate 持久化语义修正
 
-## 7. §7 待答问题 —— codex 默认建议（已采纳为 v2 推荐，待老滕 grill 拍板）
+## 7. §7 待答问题 —— codex 默认建议（已采纳为 v2 推荐，待用户 grill 拍板）
 
 - [x] **goal-mode 输入不支持 list**，严格 1 节点 = 1 goal。
 - [x] **DAG 跑中途**：MVP 只支持 **cancel / pause-on-gate / retry-node**，不支持用户改 DAG 拓扑。
@@ -296,7 +300,7 @@ $RUN_DIR/<runId>/
 - [x] **失败传播**：默认 **fail-fast**；后续再加 `optional: true` / `continueOnFailure`。
 - [x] **grill「够了」标准**：能产出节点级 `goal / inputs / expected outputs / acceptance criteria / risk gates`，否则继续问。
 
-> 以上为 codex 默认建议、claude 认可。老滕 grill 时可逐条推翻。
+> 以上为 codex 默认建议、claude 认可。用户 grill 时可逐条推翻。
 
 ## 8. 风险
 
@@ -331,4 +335,4 @@ v3 的 file-path 透传跟这个完全不一样——v0.2 引用是 JSON 字段�
 | 禁工具 | 一刀切禁 | best-effort + hook 能力矩阵（Claude 硬拦 / 其它软约束） |
 | manifest | name/path/kind/preview | + bytes/sha256/mime；path 越权校验；kind 枚举；preview 限长 |
 | spec.md | 决策树+结论 | + 验收标准 + 非目标 |
-| §7 | 6 条待答 | codex 默认建议全部填入，待老滕拍板 |
+| §7 | 6 条待答 | codex 默认建议全部填入，待用户拍板 |

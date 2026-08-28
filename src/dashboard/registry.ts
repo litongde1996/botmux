@@ -12,6 +12,10 @@ export interface DaemonInfo {
   ipcPort: number;
   pid: number;
   startedAt: number;
+  /** Random per-process audience for authenticated Workflow v3 mutations. */
+  bootInstanceId?: string;
+  /** Auth protocol advertised atomically with the boot identity. */
+  workflowIpcProtocol?: string;
   lastHeartbeat: number;
   /**
    * open_ids of users the bot's allowedUsers list was resolved to (post-email
@@ -26,6 +30,20 @@ const STALE_MS = 90_000;
 const DEFAULT_REFRESH_MS = 15_000;
 
 export type RegistryListener = (online: DaemonInfo[]) => void;
+
+/**
+ * Stable roster fingerprint used to tell a real roster change (bot added /
+ * removed / renamed / re-indexed) apart from the 15s no-op poll and the 30s
+ * heartbeat rewrites. Only fields the dashboard's Bot 配置 list keys off of are
+ * included — a pure heartbeat bump (lastHeartbeat) must NOT change it, or the
+ * `/events` bots.changed emitter would fire every poll. Order-independent.
+ */
+export function botsRosterSignature(online: DaemonInfo[]): string {
+  return [...online]
+    .map(d => `${d.larkAppId}:${d.botName ?? ''}:${d.cliId ?? ''}:${d.botIndex}`)
+    .sort()
+    .join('|');
+}
 
 export interface DaemonRegistryOptions {
   refreshIntervalMs?: number;

@@ -49,14 +49,18 @@ botmux skill resources deploy-runbook
 
 ```bash
 botmux skills install ./skills/deploy-runbook
+botmux skills install ./skills --skill deploy-runbook
 botmux skills install ./skills/deploy-runbook --link
 ```
 
 `--link` 用于开发态，registry 记录原目录；不加 `--link` 会 vendor copy 到 `~/.botmux/skills/store`。
 
-Git 仓库安装：
+Git 仓库安装可以直接给仓库根目录。仓库里只有一个 Skill 时会直接安装；多个 Skill 时先用 `discover` 查看候选，再用 `--skill` 指定一个或用 `--all` 安装全部：
 
 ```bash
+botmux skills discover git+https://github.com/acme/agent-skills.git
+botmux skills install git+https://github.com/acme/agent-skills.git --skill deploy-runbook
+botmux skills install git+https://github.com/acme/agent-skills.git --all
 botmux skills install git+https://github.com/acme/agent-skills.git --path skills/deploy-runbook
 botmux skills install git@github.com:acme/agent-skills.git --path skills/deploy-runbook --ref v1.2.0
 ```
@@ -64,13 +68,47 @@ botmux skills install git@github.com:acme/agent-skills.git --path skills/deploy-
 GitHub 简写：
 
 ```bash
+botmux skills install github:acme/agent-skills --skill deploy-runbook
 botmux skills install github:acme/agent-skills/skills/deploy-runbook
 botmux skills install github:acme/agent-skills --path skills/deploy-runbook --ref main
 ```
 
-私有仓库认证交给系统 Git 凭证、SSH agent 或 `gh auth`。botmux 不保存 GitHub token；带 username/password/token 的 HTTPS Git URL 会被拒绝，避免凭证进入 registry 或 Dashboard。
+私有仓库可复用部署机已有权限：GitHub HTTPS 来源依次读取进程或 `~/.botmux/.env` 中的 `GITHUB_TOKEN` / `GH_TOKEN`、当前 `gh auth` 账号；若注入的 token 鉴权失败，会先去掉临时请求头，让公开仓库匿名访问或系统 Git credential helper 接管，仍为鉴权失败时才自动改用 SSH URL 重试。显式 `git@github.com:owner/repo.git` 来源也直接使用 SSH agent/key。botmux 只把 HTTPS token 作为限定到 `github.com` 的临时 Git 请求头，不写入 URL、命令行或 registry；带 username/password/token 的 HTTPS Git URL 会被拒绝，避免凭证进入 Dashboard 和错误日志。
 Git/GitHub 的 `--path` 必须是仓库内相对路径；绝对路径、`..` segment 或解析到 checkout 外部的 symlink 会被拒绝。
 Git 安装/更新会给底层 Git 命令设置超时，默认 60 秒；需要更长时间时可设置 `BOTMUX_SKILL_GIT_TIMEOUT_MS`。
+Dashboard/CLI 的 Git `discover` 使用一次性 checkout，扫描结束即删除；只有实际安装/更新的来源保留在 `~/.botmux/skills/sources`，避免预览 URL 与最终安装 URL 不同时留下两份长期缓存。
+
+Dashboard 安装/更新 job 完成后会通过现有 logger 写入 `[skills:audit]` 静态审计摘要，包括来源类型、commit、版本、文件/目录/symlink/字节数、相对可执行文件路径与 shebang runtime。审计不记录来源 URL 或绝对路径，也不会执行 Skill 的安装脚本、二进制或测试；失败 job 记录脱敏后的错误。
+
+### 制品仓库（agentbuddy）
+
+复用外部 `agentbuddy` CLI 从制品仓库安装 skill —— registry 地址与鉴权都在部署机的 `agentbuddy` 里，botmux 源码不硬编码任何仓库信息：
+
+直接粘贴 marketplace「复制安装命令」即可（dashboard 尤其方便，贴上即装、跳过 discover；CLI 里命令带空格要加引号）：
+
+```bash
+botmux skills install "agentbuddy skill collection add <uid>"
+botmux skills install "agentbuddy plugin collection add <uid>"
+botmux skills install "agentbuddy skill add <group> --skill <name>"
+botmux skills install "npm_config_registry=\"https://registry.example.com\" npx -y agentbuddy@latest skill add <group>/<name>"
+```
+
+- 兼容命令前面带的 `npm_config_registry="…" npx agentbuddy@latest …` 前缀（自动剥离），也兼容 marketplace 常见的 `skill add <group>/<name>` 合并路径。botmux 用部署机自己配置的 agentbuddy 执行，**域名无关、无需额外配置**。
+- 仅接受 `skill` / `plugin` 的 `add` / `collection add` 安装类子命令，其它子命令（publish/remove/login 等）不受理。
+- plugin 命令也会执行，但收进 botmux 的是该 plugin **内含的 SKILL.md**（botmux 是 skill registry；plugin 不含 skill 则无内容可装）。
+- **开源 skills**（vercel-labs 的 `skills` CLI）：也认 `skills add owner/repo` / `npx skills add owner/repo` / `add-skill owner/repo`，包括 source 前后的 `-g` / `--global` 和带引号 source —— 这些粘贴命令统一走 botmux 自己的 **GitHub 安装**（无需部署机装 `skills` CLI，公开仓库免鉴权，与贴 GitHub 链接等价；`-g` 仅作输入兼容，安装位置仍由 botmux registry 管理）。
+
+- 需要部署机装好 `agentbuddy` 并登录一次（`agentbuddy login`），凭证缓存后复用；未安装/未登录时返回 `agentbuddy_not_found` / `agentbuddy_command_failed`（dashboard 会提示去安装/登录）。
+- agentbuddy 自解析 skill 集合，安装/更新不走 discover-then-select；同一 identifier 的并发安装/更新会串行化，避免互相清空暂存目录。
+- botmux 在拷进 store 前用 agentbuddy 内置的 `clear-embedded-telemetry` 剥离制品内嵌的用量上报，并做 fail-closed 后置校验（残留即中断安装）；确需保留时设 `BOTMUX_AGENTBUDDY_KEEP_TELEMETRY=1`。
+
+相关环境变量：
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `BOTMUX_AGENTBUDDY_CMD` | `agentbuddy` | 调用的命令（可设为 `npx -y agentbuddy@latest`）；私有 npm registry 由部署机 npmrc/env 提供 |
+| `BOTMUX_AGENTBUDDY_TIMEOUT_MS` | `180000` | 单次 agentbuddy 调用超时 |
+| `BOTMUX_AGENTBUDDY_KEEP_TELEMETRY` | 关 | 设 `1` 保留内嵌 telemetry（默认剥离） |
 
 更新、查看和移除：
 
@@ -101,7 +139,7 @@ bot 级配置只表达“这个 bot 优先披露哪些 Skill”。注入方式�
 
 字段含义：
 
-- `include`: priority skill 列表，只支持 `skill:<name>`。这些 Skill 会优先披露给该 bot；底层 CLI 原生 Skill 发现机制保持原样。
+- `include`: priority selector 列表，支持直接引用 `skill:<name>` 和专项包引用 `pack:<id>`。直接引用始终先于专项包展开，因此同一 Skill 同时出现时以直接引用为准；底层 CLI 原生 Skill 发现机制保持原样。
 - 全局工作区 Skill：`off | all`，决定解析 priority skill 时是否把当前工作区 `.agents/skills` 和 `.botmux/skills` 纳入候选。旧配置里的 `trusted` 会作为 `all` 的兼容别名读取，并在解析诊断里提示 deprecated；当前没有单独的项目 trust store。
 - 全局 delivery：`auto | prompt | native`。`auto` 会优先使用可用 native 投递，否则走 prompt；`native` 在目标 CLI 不支持时会阻止新会话启动并报配置错误。
 
@@ -117,11 +155,52 @@ bot 级配置只表达“这个 bot 优先披露哪些 Skill”。注入方式�
 
 Dashboard 的 `Skills` 页也提供同一套管理入口：
 
-- 安装、更新、删除 registry skill（支持本机目录、Git、GitHub 简写）。
+- 安装、更新、删除 registry skill（支持本机目录、Git、GitHub 简写、agentbuddy 制品仓库）。agentbuddy 源在安装框直接粘贴 `agentbuddy:<group>/<skill>` 或 `agentbuddy:collection/<uid>` 即可，跳过 discover 直接安装。
 - 设置全局 project skill 默认值和全局 delivery 默认值。
 - 为每个 bot attach/detach 已安装 skill，维护 direct priority skill 列表。
 
 Dashboard 的安装/更新会作为后台 job 执行，页面显示处理中状态并轮询结果；慢 Git clone/fetch 不会占住整个 HTTP 请求。
+
+## Skill Pack（专项包）
+
+专项包是一组已安装 Skill 的命名集合，可以一次性分配给多个 bot，避免逐个 bot 重复勾选。专项包只保存 `skill:<name>` 引用，不复制 Skill 文件；修改专项包后，所有引用它的 bot 在新会话中自动使用最新内容。
+
+专项包独立持久化在 `~/.botmux/skills/packs.json`，不写入 `registry.json`，也不需要迁移现有 bot 配置。
+
+### 分配专项包
+
+bot 的 `skills.include` 字段同时接受 `skill:<name>` 和 `pack:<id>`：
+
+```json
+{
+  "skills": {
+    "include": ["pack:sre-oncall", "skill:custom-helper"]
+  }
+}
+```
+
+解析顺序：直接 `skill:*` 引用优先（显式配置拥有最强解释权），然后按 policy 中的顺序展开 `pack:*`，最后按 Skill 名称去重。同一个 Skill 同时被直接引用和专项包引用时，直接引用胜出。
+
+### CLI 管理
+
+```text
+botmux skills pack list
+botmux skills pack show <id>
+botmux skills pack create --id <slug> --name <名称> --skill <name> [--skill <name>]... [--description <说明>] [--tag <标签>]...
+botmux skills pack update <id> [--name <名称>] [--skill <name>]... [--expected-revision <n>]
+botmux skills pack delete <id> [--force]
+```
+
+约束：
+
+- `id` 是稳定 slug（小写字母、数字、连字符），创建后不可修改。
+- `include` 只允许 `skill:*`，不允许嵌套 `pack:*`，至少包含一个 Skill，自动去重。
+- 每次内容更新 `revision` 递增；`update` 可带 `--expected-revision` 做乐观并发控制。
+- 删除被 bot 引用的专项包默认阻止，需 `--force`。删除专项包不会卸载成员 Skill。
+
+### 聊天命令与降级
+
+`/skills attach <name>` / `/skills detach <name>` 只增删 `skill:*` 项，原样保留 `pack:*` 项，不会清空专项包分配。`/skills` 状态输出会同时显示 priority skills 和 packs。
 
 ## Delivery 行为
 

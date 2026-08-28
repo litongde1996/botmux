@@ -30,6 +30,32 @@ describe('InflightInputTracker', () => {
     expect(t.takeCarryOver()).toEqual([]);
   });
 
+  it('preserves the Codex App structured sidecar across a crash replay', () => {
+    const t = new InflightInputTracker();
+    const codexAppInput = {
+      text: 'clean',
+      additionalContext: { botmux_sender: { kind: 'untrusted' as const, value: 'Alice' } },
+    };
+    t.onWrite({ content: '<legacy />', turnId: 'om_1', codexAppInput });
+    expect(t.onCliExit()).toBe(1);
+    expect(t.takeCarryOver()).toEqual([{ content: '<legacy />', turnId: 'om_1', codexAppInput }]);
+  });
+
+  it('preserves logical content for a deferred transport command across crash replay', () => {
+    const t = new InflightInputTracker();
+    t.onWrite({
+      content: '/botmux-initial-prompt',
+      logicalContent: 'full original prompt',
+      turnId: 'om_1',
+    });
+    expect(t.onCliExit()).toBe(1);
+    expect(t.takeCarryOver()).toEqual([{
+      content: '/botmux-initial-prompt',
+      logicalContent: 'full original prompt',
+      turnId: 'om_1',
+    }]);
+  });
+
   it('completed turn: idle clears in-flight, a later crash re-queues nothing', () => {
     const t = new InflightInputTracker();
     t.onWrite(item('hello'));
@@ -39,6 +65,76 @@ describe('InflightInputTracker', () => {
     expect(t.takeCarryOver()).toEqual([]);
   });
 
+  it('durable terminal clears the attempt before a later CLI exit can carry it over', () => {
+    const t = new InflightInputTracker();
+    t.onWrite({ content: 'meeting delivery', turnId: 'delivery-1', dispatchAttempt: 3 });
+
+    // worker emitTurnTerminal uses this same completion edge before releasing
+    // the durable arbiter back to the receiver-owned replay loop.
+    t.onTurnComplete();
+
+    expect(t.onCliExit()).toBe(0);
+    expect(t.takeCarryOver()).toEqual([]);
+  });
+
+  it('CLI exit leaves durable replay to the receiver while preserving ordinary carry-over', () => {
+    const t = new InflightInputTracker();
+    t.onWrite({ content: 'ordinary IM', turnId: 'im-1' });
+    t.onWrite({ content: 'meeting delivery', turnId: 'delivery-1', dispatchAttempt: 2 });
+
+    expect(t.onCliExit(item => item.dispatchAttempt === undefined)).toBe(1);
+    expect(t.takeCarryOver()).toEqual([{ content: 'ordinary IM', turnId: 'im-1' }]);
+  });
+
+  it('at-most-once (noReplay) input is NEVER carried over, but a plain sibling IS — per-item, not per-session', () => {
+    // codex #776 round-7 #1 + round-8: a keyed idempotency turn (dispatchAttempt
+    // undefined, so it would otherwise look like ordinary carry-over) is marked
+    // noReplay. The daemon terminalizes it to dispatch_unknown on CLI exit, so
+    // replaying it onto the auto-restarted CLI would run a turn the caller already
+    // saw failed. Round-8: the exclusion MUST be per-item — a plain (no-key)
+    // follow-up turn folded into the same http_async_ session via target.sessionId
+    // must SURVIVE the same CLI exit, not be dropped by a whole-session flag.
+    const t = new InflightInputTracker();
+    t.onWrite({ content: 'plain follow-up (same session, no key)', turnId: 'im-1' });
+    t.onWrite({ content: 'keyed async turn', turnId: 'trg_k', noReplay: true });
+
+    // Worker's real predicate: dispatchAttempt===undefined && !noReplay.
+    expect(t.onCliExit(item => item.dispatchAttempt === undefined && !item.noReplay)).toBe(1);
+    // The keyed at-most-once turn is dropped; the plain sibling is preserved for replay.
+    expect(t.takeCarryOver()).toEqual([{ content: 'plain follow-up (same session, no key)', turnId: 'im-1' }]);
+  });
+
+  it('preserves a clean explicit-IM envelope but leaves a clean durable replay to the receiver', () => {
+    const t = new InflightInputTracker();
+    const codexAppInput = { text: 'clean' };
+    const origin = {
+      listenerAppId: 'listener', meetingId: 'meeting', memberId: 'member',
+      memberEpoch: 1, agentAppId: 'agent', ownerBootId: 'boot', ownerEpoch: 1,
+      membershipGeneration: 1, sinkOwnerGeneration: 1,
+      receiverSessionId: 'receiver', larkMessageId: 'im-clean',
+    };
+    t.onWrite({
+      content: '<legacy IM />',
+      turnId: 'im-clean',
+      vcMeetingImTurnOrigin: origin,
+      codexAppInput,
+    });
+    t.onWrite({
+      content: '<legacy delivery />',
+      turnId: 'delivery-clean',
+      dispatchAttempt: 7,
+      codexAppInput,
+    });
+
+    expect(t.onCliExit(item => item.dispatchAttempt === undefined)).toBe(1);
+    expect(t.takeCarryOver()).toEqual([{
+      content: '<legacy IM />',
+      turnId: 'im-clean',
+      vcMeetingImTurnOrigin: origin,
+      codexAppInput,
+    }]);
+  });
+
   it('type-ahead: multiple writes before idle are all carried over in order', () => {
     const t = new InflightInputTracker();
     t.onWrite(item('msg-1', 'a'));
@@ -46,6 +142,19 @@ describe('InflightInputTracker', () => {
 
     expect(t.onCliExit()).toBe(2);
     expect(t.takeCarryOver().map(i => i.content)).toEqual(['msg-1', 'msg-2']);
+  });
+
+  it('retires only an ambiguous write so a restart cannot blindly replay it', () => {
+    const t = new InflightInputTracker();
+    const ambiguous = item('possibly submitted', 'a');
+    const later = item('not attempted yet', 'b');
+    t.onWrite(ambiguous);
+    t.onWrite(later);
+
+    expect(t.retire(ambiguous)).toBe(true);
+    expect(t.retire(ambiguous)).toBe(false);
+    expect(t.onCliExit()).toBe(1);
+    expect(t.takeCarryOver()).toEqual([later]);
   });
 
   it('double exit before respawn keeps the earlier stash (appends, not replaces)', () => {

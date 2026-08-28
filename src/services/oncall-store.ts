@@ -24,6 +24,14 @@ import { expandHomePath } from '../utils/working-dir.js';
 
 /**
  * Upsert an oncall binding. Returns whether it was newly created.
+ *
+ * A manual bind is an explicit opt-IN, so it clears any tombstone in
+ * `defaultOncallAutoboundChats` — the tombstone means "auto-bind must not
+ * touch this chat again" (written by unbind and by auto-bind itself), and it
+ * doubles as the provenance list for the leave-oncall release in
+ * {@link setWorkingDirMode}. Clearing it here keeps both consumers honest: a
+ * manually (re-)bound chat is neither auto-bind territory nor releasable as
+ * "auto-bound". A later unbind re-tombstones as before.
  */
 export async function bindOncall(
   larkAppId: string,
@@ -41,6 +49,9 @@ export async function bindOncall(
     if (created) cur.push(next);
     else cur[curIdx] = next; // wholesale replace strips legacy keys
     entry.oncallChats = cur;
+    if (Array.isArray(entry.defaultOncallAutoboundChats) && entry.defaultOncallAutoboundChats.includes(chatId)) {
+      entry.defaultOncallAutoboundChats = entry.defaultOncallAutoboundChats.filter((c: string) => c !== chatId);
+    }
     return { write: true, result: { created } };
   });
   if (!r.ok) return { ok: false, reason: r.reason };
@@ -49,6 +60,9 @@ export async function bindOncall(
   const inMem = (bot.config.oncallChats ??= []);
   const memIdx = inMem.findIndex(c => c.chatId === chatId);
   if (memIdx >= 0) inMem[memIdx] = next; else inMem.push(next);
+  if (bot.config.defaultOncallAutoboundChats?.includes(chatId)) {
+    bot.config.defaultOncallAutoboundChats = bot.config.defaultOncallAutoboundChats.filter(c => c !== chatId);
+  }
 
   logger.info(`[oncall:${larkAppId}] bind chat=${chatId} dir=${workingDir}`);
   return { ok: true, entry: next, created: r.result.created };
@@ -193,24 +207,34 @@ export async function updateBotDefaultOncall(
  *   • 'default' → set defaultWorkingDir=dir; disable defaultOncall (keep prior dir).
  *   • 'oncall'  → enable defaultOncall(dir) + re-stamp `since`; clear defaultWorkingDir.
  *
+ * `autoWorktree` only applies to 'default' mode (每个新会话自动建 worktree)：写入其中，
+ * 其余模式一律清掉（该开关脱离 defaultWorkingDir 无意义，避免残留脏态）。
+ *
  * Caller validates `workingDir` (dir existence) first; it is ignored for 'off'.
  */
 export async function setWorkingDirMode(
   larkAppId: string,
   mode: 'off' | 'default' | 'oncall',
   workingDir: string,
+  autoWorktree = false,
 ): Promise<
-  | { ok: true; defaultOncall: BotDefaultOncall; defaultWorkingDir: string | null }
+  | { ok: true; defaultOncall: BotDefaultOncall; defaultWorkingDir: string | null; defaultWorkingDirAutoWorktree: boolean }
   | { ok: false; reason: string }
 > {
   let bot;
   try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
 
   const dir = (workingDir ?? '').trim();
+  // The toggle only rides along with 'default' mode; force it off otherwise.
+  const nextAutoWorktree = mode === 'default' && autoWorktree === true;
   let nextOncall: BotDefaultOncall | null = null;
   let nextWorkingDir: string | null = null;
 
-  const r = await rmwBotEntry<null>(larkAppId, (entry) => {
+  const r = await rmwBotEntry<{
+    nextOncall: BotDefaultOncall;
+    nextWorkingDir: string | null;
+    removedAutoboundChats: string[];
+  }>(larkAppId, (entry) => {
     const prior: BotDefaultOncall | undefined = entry.defaultOncall;
     if (mode === 'oncall') {
       nextOncall = { enabled: true, workingDir: dir, since: Date.now() };
@@ -220,22 +244,60 @@ export async function setWorkingDirMode(
       nextOncall = { enabled: false, workingDir: prior?.workingDir ?? '', since: prior?.since ?? 0 };
       nextWorkingDir = mode === 'default' ? dir : null;
     }
+
+    // Leaving an ENABLED oncall mode: chats that were auto-bound by the
+    // defaultOncall flow must be released so they fall back to the bot-level
+    // defaultWorkingDir (or the repo-select card) instead of staying pinned to
+    // the old oncall dir. `defaultOncallAutoboundChats` is a tombstone list
+    // ("auto-bind's one shot is spent") — manual unbinds land there too and a
+    // manual re-bind does NOT remove the entry — so tombstone membership alone
+    // cannot distinguish a live auto-bind from a manual re-bind. Release only
+    // chats that ALSO still point at the outgoing oncall dir: a manual re-bind
+    // to a different dir is the user's explicit choice and is kept.
+    const autobound: string[] = Array.isArray(entry.defaultOncallAutoboundChats)
+      ? entry.defaultOncallAutoboundChats : [];
+    let removedAutoboundChats: string[] = [];
+    if (mode !== 'oncall' && prior?.enabled === true && autobound.length > 0) {
+      const cur: OncallChat[] = Array.isArray(entry.oncallChats) ? entry.oncallChats : [];
+      const kept: OncallChat[] = [];
+      for (const c of cur) {
+        if (c && autobound.includes(c.chatId) && c.workingDir === prior.workingDir) {
+          removedAutoboundChats.push(c.chatId);
+        } else {
+          kept.push(c);
+        }
+      }
+      entry.oncallChats = kept;
+    }
+
     entry.defaultOncall = nextOncall;
     if (nextWorkingDir === null) delete entry.defaultWorkingDir;
     else entry.defaultWorkingDir = nextWorkingDir;
-    return { write: true, result: null };
+    if (nextAutoWorktree) entry.defaultWorkingDirAutoWorktree = true;
+    else delete entry.defaultWorkingDirAutoWorktree;
+    return { write: true, result: { nextOncall, nextWorkingDir, removedAutoboundChats } };
   });
   if (!r.ok) return { ok: false, reason: r.reason };
 
   // Sync in-memory config (runtime reads bot.config directly — no restart needed).
   bot.config.defaultOncall = nextOncall!;
   bot.config.defaultWorkingDir = nextWorkingDir ?? undefined;
+  bot.config.defaultWorkingDirAutoWorktree = nextAutoWorktree || undefined;
+  const removedAutoboundChats = r.result.removedAutoboundChats;
+  if (removedAutoboundChats.length > 0 && bot.config.oncallChats) {
+    bot.config.oncallChats = bot.config.oncallChats.filter(
+      c => !removedAutoboundChats.includes(c.chatId),
+    );
+  }
   logger.info(
     `[oncall:${larkAppId}] working-dir mode=${mode} ` +
-    `(defaultWorkingDir=${nextWorkingDir ?? '∅'}, oncall.enabled=${nextOncall!.enabled}, ` +
-    `oncall.dir=${nextOncall!.workingDir || '∅'})`,
+    `(defaultWorkingDir=${nextWorkingDir ?? '∅'}, autoWorktree=${nextAutoWorktree}, ` +
+    `oncall.enabled=${nextOncall!.enabled}, oncall.dir=${nextOncall!.workingDir || '∅'}` +
+    (removedAutoboundChats.length > 0
+      ? `, released autobound chats=[${removedAutoboundChats.join(', ')}]`
+      : ''),
   );
-  return { ok: true, defaultOncall: nextOncall!, defaultWorkingDir: nextWorkingDir };
+  return { ok: true, defaultOncall: nextOncall!, defaultWorkingDir: nextWorkingDir, defaultWorkingDirAutoWorktree: nextAutoWorktree };
 }
 
 /**

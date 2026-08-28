@@ -2,10 +2,13 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { tsRunnerPrefix, tsEvalArgs } from './helpers/ts-runner.js';
 
 import {
   filterMatches,
+  emitHookEvent,
+  forwardEmitToDaemon,
   loadHookConfigs,
   parseHookCommand,
   prepareHookPayload,
@@ -35,6 +38,76 @@ describe('parseHookCommand', () => {
   it('rejects empty or malformed command strings', () => {
     expect(() => parseHookCommand('')).toThrow(/empty/i);
     expect(() => parseHookCommand('node "unterminated')).toThrow(/unterminated/i);
+  });
+});
+
+describe('managed hook forwarding', () => {
+  it('uses only the frozen protected port and exact original tuple', async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async () => new Response(null, { status: 202 }));
+    globalThis.fetch = fetchMock as typeof fetch;
+    try {
+      await forwardEmitToDaemon(
+        'outbound.send',
+        { event: 'outbound.send', content: 'old payload' },
+        'poisoned-discovery-app',
+        {
+          ipcPort: 4310,
+          sessionId: 'sid-original',
+          capability: 'ab'.repeat(32),
+          turnId: 'turn-original',
+          dispatchAttempt: 3,
+        },
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(String(url)).toBe('http://127.0.0.1:4310/api/hooks/emit');
+    expect(JSON.parse(String((init as RequestInit).body))).toMatchObject({
+      sessionId: 'sid-original',
+      originCapability: 'ab'.repeat(32),
+      originTurnId: 'turn-original',
+      originDispatchAttempt: 3,
+    });
+  });
+
+  it('forwards managed origin even when session env is blank instead of running local hooks', async () => {
+    const marker = join(tmpDir, 'must-not-run-local');
+    const oldSession = process.env.BOTMUX_SESSION_ID;
+    const oldApp = process.env.BOTMUX_LARK_APP_ID;
+    const oldHooks = process.env.BOTMUX_HOOKS_JSON;
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async () => new Response(null, { status: 202 }));
+    process.env.BOTMUX_SESSION_ID = '';
+    process.env.BOTMUX_LARK_APP_ID = '';
+    process.env.BOTMUX_HOOKS_JSON = JSON.stringify([
+      { event: 'outbound.send', command: `/usr/bin/touch ${marker}` },
+    ]);
+    globalThis.fetch = fetchMock as typeof fetch;
+    try {
+      emitHookEvent('outbound.send', { content: 'managed' }, {
+        managedOrigin: {
+          ipcPort: 4311,
+          sessionId: 'sid-managed',
+          capability: 'cd'.repeat(32),
+          turnId: 'turn-managed',
+        },
+      });
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+      await new Promise(resolve => setTimeout(resolve, 25));
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (oldSession === undefined) delete process.env.BOTMUX_SESSION_ID;
+      else process.env.BOTMUX_SESSION_ID = oldSession;
+      if (oldApp === undefined) delete process.env.BOTMUX_LARK_APP_ID;
+      else process.env.BOTMUX_LARK_APP_ID = oldApp;
+      if (oldHooks === undefined) delete process.env.BOTMUX_HOOKS_JSON;
+      else process.env.BOTMUX_HOOKS_JSON = oldHooks;
+    }
   });
 });
 
@@ -280,17 +353,19 @@ describe('runHookCommandForTest', () => {
 
   it('does not keep CLI-style emitHookEvent processes alive for running hooks', () => {
     const started = Date.now();
+    // Node needs `--import tsx` on top of the eval args because the snippet
+    // imports a repo .ts module; Bun runs TypeScript natively.
+    const { command, prefixArgs } = tsRunnerPrefix();
     const result = spawnSync(
-      process.execPath,
+      command,
       [
-        '--import',
-        'tsx',
-        '--input-type=module',
-        '-e',
-        [
-          "const { emitHookEvent } = await import('./src/services/hook-runner.ts');",
-          "emitHookEvent('outbound.send', { content: 'hello' });",
-        ].join('\n'),
+        ...prefixArgs,
+        ...tsEvalArgs(
+          [
+            "const { emitHookEvent } = await import('./src/services/hook-runner.ts');",
+            "emitHookEvent('outbound.send', { content: 'hello' });",
+          ].join('\n'),
+        ).args,
       ],
       {
         cwd: process.cwd(),
@@ -317,17 +392,17 @@ describe('runHookCommandForTest', () => {
     // session-scoped env leaked into the process (e.g. pm2 startOrRestart
     // injecting the caller's environment after an in-session `botmux restart`).
     const marker = join(tmpDir, 'daemon-local-spawn-touched');
+    const { command, prefixArgs } = tsRunnerPrefix();
     const result = spawnSync(
-      process.execPath,
+      command,
       [
-        '--import',
-        'tsx',
-        '--input-type=module',
-        '-e',
-        [
-          "const { emitHookEventLocal } = await import('./src/services/hook-runner.ts');",
-          "emitHookEventLocal('outbound.send', { content: 'hi' });",
-        ].join('\n'),
+        ...prefixArgs,
+        ...tsEvalArgs(
+          [
+            "const { emitHookEventLocal } = await import('./src/services/hook-runner.ts');",
+            "emitHookEventLocal('outbound.send', { content: 'hi' });",
+          ].join('\n'),
+        ).args,
       ],
       {
         cwd: process.cwd(),
@@ -362,17 +437,17 @@ describe('runHookCommandForTest', () => {
     // running, so findOnlineDaemon returns null and the forward silently
     // drops — the local-spawn marker file therefore must not appear.
     const marker = join(tmpDir, 'local-spawn-touched');
+    const { command, prefixArgs } = tsRunnerPrefix();
     const result = spawnSync(
-      process.execPath,
+      command,
       [
-        '--import',
-        'tsx',
-        '--input-type=module',
-        '-e',
-        [
-          "const { emitHookEvent } = await import('./src/services/hook-runner.ts');",
-          "emitHookEvent('outbound.send', { content: 'hi' });",
-        ].join('\n'),
+        ...prefixArgs,
+        ...tsEvalArgs(
+          [
+            "const { emitHookEvent } = await import('./src/services/hook-runner.ts');",
+            "emitHookEvent('outbound.send', { content: 'hi' });",
+          ].join('\n'),
+        ).args,
       ],
       {
         cwd: process.cwd(),

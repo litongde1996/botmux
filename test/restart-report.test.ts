@@ -3,8 +3,13 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { countActiveSessionsOnDisk } from '../src/services/session-store.js';
-import { buildRestartReportText, sendRestartReportIfPending } from '../src/core/restart-report.js';
-import { writeRestartIntentTo, restartIntentPathIn } from '../src/services/restart-intent-store.js';
+import { buildRestartReportText, sendRestartReportIfPending, fetchChangelog } from '../src/core/restart-report.js';
+import {
+  commitRestartIntentAttemptTo,
+  restartIntentPathIn,
+  writeRestartAttemptIntentTo,
+  writeRestartIntentTo,
+} from '../src/services/restart-intent-store.js';
 
 function writeSessions(dir: string, name: string, sessions: Record<string, { status: string }>) {
   writeFileSync(join(dir, name), JSON.stringify(sessions));
@@ -49,6 +54,29 @@ describe('buildRestartReportText', () => {
     expect(md.toLowerCase()).not.toContain('changelog');
   });
 
+  it('adds a local ip:port fallback line when the dashboard link is a platform URL', () => {
+    const md = buildRestartReportText({
+      kind: 'manual',
+      version: '2.65.0',
+      sessionCount: 0,
+      dashboardUrl: 'https://m-deadbeef.example/?t=tok',
+      dashboardLocalUrl: 'http://10.0.0.1:7891/?t=tok',
+    });
+    expect(md).toContain('https://m-deadbeef.example/?t=tok'); // platform primary
+    expect(md).toContain('http://10.0.0.1:7891/?t=tok');       // local fallback
+  });
+
+  it('omits the local fallback line when there is no platform URL (local-only host)', () => {
+    const md = buildRestartReportText({
+      kind: 'manual',
+      version: '2.65.0',
+      sessionCount: 0,
+      dashboardUrl: 'http://10.0.0.1:7891/?t=tok',
+    });
+    // Only the single dashboard line — no separate "本地直连 / Local direct" line.
+    expect(md).not.toMatch(/本地直连|Local direct/);
+  });
+
   it('update restart: shows old→new and the changelog body', () => {
     const md = buildRestartReportText({
       kind: 'update',
@@ -75,6 +103,21 @@ describe('buildRestartReportText', () => {
     });
     expect(md).toContain('2.64.0');
     expect(md).toContain('2.65.0');
+  });
+
+  it('rollback restart reports the old→new delta without a changelog', () => {
+    const md = buildRestartReportText({
+      kind: 'rollback',
+      version: '3.0.0',
+      sessionCount: 0,
+      oldVersion: '3.1.0',
+      newVersion: '3.0.0',
+      changelog: 'must not be shown',
+    });
+    expect(md).toContain('已回退并重启');
+    expect(md).toContain('3.1.0');
+    expect(md).toContain('3.0.0');
+    expect(md).not.toContain('must not be shown');
   });
 });
 
@@ -138,5 +181,123 @@ describe('sendRestartReportIfPending', () => {
     await sendRestartReportIfPending(w);
     await sendRestartReportIfPending(w);
     expect(sent).toHaveLength(1);
+  });
+
+  it('atomically reclaims a commit that lands after the prepared observation', async () => {
+    writeRestartAttemptIntentTo(
+      dir,
+      { kind: 'manual', at: new Date(T0).toISOString() },
+      T0,
+      'attempt-full-fleet',
+    );
+    const wait = vi.fn(async () => {
+      expect(commitRestartIntentAttemptTo(dir, 'attempt-full-fleet')).toBe(true);
+    });
+    const { w, sent } = fakeWiring({
+      wait,
+      preparedCommitWaitMs: 100,
+    });
+
+    await sendRestartReportIfPending(w);
+
+    expect(wait).toHaveBeenCalledOnce();
+    expect(sent).toHaveLength(1);
+    expect(existsSync(restartIntentPathIn(dir))).toBe(false);
+  });
+
+  it('keeps following a durable prepared intent past the legacy 45s window until commit', async () => {
+    writeRestartAttemptIntentTo(
+      dir,
+      { kind: 'manual', at: new Date(T0).toISOString() },
+      T0,
+      'attempt-slow-full-fleet',
+    );
+    let elapsedMs = 0;
+    let committed = false;
+    const wait = vi.fn(async (delayMs: number) => {
+      elapsedMs += delayMs;
+      if (!committed && elapsedMs > 45_000) {
+        committed = commitRestartIntentAttemptTo(dir, 'attempt-slow-full-fleet');
+      }
+    });
+    const { w, sent } = fakeWiring({
+      now: () => T0 + elapsedMs,
+      wait,
+    });
+
+    await sendRestartReportIfPending(w);
+
+    expect(elapsedMs).toBeGreaterThan(45_000);
+    expect(committed).toBe(true);
+    expect(sent).toHaveLength(1);
+    expect(existsSync(restartIntentPathIn(dir))).toBe(false);
+  });
+
+  it('stops following a prepared intent when its durable freshness expires', async () => {
+    writeRestartAttemptIntentTo(
+      dir,
+      { kind: 'manual', at: new Date(T0).toISOString() },
+      T0,
+      'attempt-stuck',
+    );
+    let nowMs = T0;
+    const wait = vi.fn(async () => { nowMs = T0 + 10 * 60_000 + 1; });
+    const { w, sent } = fakeWiring({
+      now: () => nowMs,
+      wait,
+    });
+
+    await sendRestartReportIfPending(w);
+
+    expect(wait).toHaveBeenCalledOnce();
+    expect(sent).toHaveLength(0);
+    expect(existsSync(restartIntentPathIn(dir))).toBe(false);
+  });
+});
+
+describe('fetchChangelog', () => {
+  it('adds GitHub bearer auth when githubToken is configured', async () => {
+    let auth: string | null = null;
+    const notes = await fetchChangelog('2.85.1', {
+      auth: { env: { GITHUB_TOKEN: ' ghp_secret ' }, envFilePath: null },
+      fetchImpl: async (_input, init) => {
+        const headers = init?.headers as Record<string, string> | undefined;
+        auth = headers?.Authorization ?? headers?.authorization ?? null;
+        return { ok: true, json: async () => ({ body: 'notes' }) } as Response;
+      },
+    });
+    expect(notes).toBe('notes');
+    expect(auth).toBe('Bearer ghp_secret');
+  });
+
+  it('omits GitHub bearer auth when githubToken is blank', async () => {
+    let auth: string | null = 'present';
+    await fetchChangelog('2.85.1', {
+      auth: { env: { GITHUB_TOKEN: '   ' }, envFilePath: null },
+      fetchImpl: async (_input, init) => {
+        const headers = init?.headers as Record<string, string> | undefined;
+        auth = headers?.Authorization ?? headers?.authorization ?? null;
+        return { ok: true, json: async () => ({ body: 'notes' }) } as Response;
+      },
+    });
+    expect(auth).toBeNull();
+  });
+
+  it('uses env-file auth fallback when process env is unset', async () => {
+    let auth: string | null = null;
+    await fetchChangelog('2.85.1', {
+      auth: {
+        env: {},
+        envFilePath: '/tmp/global.env',
+        fileExists: () => true,
+        readTextFile: () => 'GITHUB_TOKEN=ghp_from_file\n',
+      },
+      fetchImpl: async (_input, init) => {
+        const headers = init?.headers as Record<string, string> | undefined;
+        auth = headers?.Authorization ?? headers?.authorization ?? null;
+        return { ok: true, json: async () => ({ body: 'notes' }) } as Response;
+      },
+    });
+    expect(auth).toBe('Bearer ghp_from_file');
   });
 });

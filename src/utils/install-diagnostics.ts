@@ -3,8 +3,8 @@
  * update" card): the running Node version, and whether more than one botmux
  * install is reachable on PATH.
  *
- * The multi-install check matters because `npm install -g botmux@latest` only
- * updates the npm-global copy. If the active `botmux` (first on PATH) is a
+ * The multi-install check matters because an update only changes the copy
+ * owned by the running install's package manager. If the active `botmux` is a
  * different install — the `~/.botmux/bin/botmux` source-checkout shim, or a
  * sibling Node version's global — the update silently doesn't take effect. We
  * surface every distinct install so the user can react before updating.
@@ -15,7 +15,8 @@
 import { execFileSync } from 'node:child_process';
 import { readFileSync, realpathSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { isLocalDevInstallAt, botmuxVersion, botmuxInstallRoot } from './install-info.js';
+import { isLocalDevInstallAt, botmuxVersionAt, botmuxInstallRoot } from './install-info.js';
+import { detectGlobalInstallManager } from './global-install.js';
 import { parseVersion } from '../core/update-check.js';
 
 /** Minimum Node major (mirrors package.json `engines.node`). */
@@ -37,20 +38,25 @@ export function checkNode(version: string = process.version, required = MIN_NODE
 }
 
 /**
- * The version to show in the update card. For an npm install this is the real
- * published version from package.json. A source checkout ships the unbuilt
- * `0.0.0` (CI injects the real version only at publish), so we derive a real
- * baseline from the latest git tag (`git describe --tags --abbrev=0` → the clean
- * tag, e.g. "v2.86.0", stripped of the leading v). That makes the version
- * display, "behind" comparison, and changelog range correct in dev mode too.
- * Falls back to the raw package.json version if git is unavailable.
+ * The version to show in the update card, for the install rooted at `rootDir`.
+ * For an npm install this is the real published version from package.json. A
+ * source checkout ships the unbuilt `0.0.0` (CI injects the real version only
+ * at publish), so we derive a real baseline from the latest git tag
+ * (`git describe --tags --abbrev=0` → the clean tag, e.g. "v2.86.0", stripped
+ * of the leading v). That makes the version display, "behind" comparison, and
+ * changelog range correct in dev mode too. Falls back to the raw package.json
+ * version if git is unavailable.
+ *
+ * Takes an explicit dir so the local-dev update path can report the version of
+ * the checkout it actually updated (the wrapper's checkout), which may differ
+ * from the running process's install root.
  */
-export function resolveCurrentVersion(): string {
-  const raw = botmuxVersion();
+export function resolveCurrentVersionAt(rootDir: string): string {
+  const raw = botmuxVersionAt(rootDir);
   if (raw !== '0.0.0') return raw;
   try {
     const tag = execFileSync('git', ['describe', '--tags', '--abbrev=0'], {
-      cwd: botmuxInstallRoot(),
+      cwd: rootDir,
       encoding: 'utf-8',
       timeout: 3_000,
       stdio: ['ignore', 'pipe', 'ignore'],
@@ -62,7 +68,18 @@ export function resolveCurrentVersion(): string {
   }
 }
 
-export type InstallKind = 'npm-global' | 'source-checkout' | 'unknown';
+/** The version to show for the running install (its own package root). */
+export function resolveCurrentVersion(): string {
+  return resolveCurrentVersionAt(botmuxInstallRoot());
+}
+
+export type InstallKind =
+  | 'npm-global'
+  | 'pnpm-global'
+  | 'yarn-global'
+  | 'bun-global'
+  | 'source-checkout'
+  | 'unknown';
 
 export interface InstallEntry {
   /** The PATH entry that resolved to this install. */
@@ -120,8 +137,9 @@ function resolveBin(binPath: string, deps: InstallProbeDeps): { cliJs: string; r
 }
 
 function classify(root: string, deps: InstallProbeDeps): InstallKind {
-  if (/[/\\]node_modules[/\\]/.test(root)) return 'npm-global';
   if (deps.isSourceCheckout(root)) return 'source-checkout';
+  const manager = detectGlobalInstallManager(root);
+  if (manager !== 'unknown') return `${manager}-global`;
   return 'unknown';
 }
 

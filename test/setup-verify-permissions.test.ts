@@ -3,7 +3,7 @@
  *
  * Run: pnpm vitest run test/setup-verify-permissions.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 
 // 占位 mock — 单测里不真实调 Lark.Client. checkRequiredScopes / applyScopesUnverified
 // 单测都需要 mock 这个.
@@ -31,13 +31,18 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 import * as sdk from '@larksuiteoapi/node-sdk';
 import {
   validateCredentials,
+  readCriticalScopesFromApplicationInfo,
   checkRequiredScopes,
   applyScopesUnverified,
   buildScopeDeepLink,
   buildEventSubDeepLink,
   buildRemainingSteps,
+  registerBotmuxRedirectUrlCollector,
   BOTMUX_REQUIRED_SCOPES,
   DOC_FEATURE_SCOPES,
+  DOC_WATCH_SCOPES,
+  VC_MEETING_BOT_EVENTS,
+  VC_MEETING_FEATURE_SCOPES,
 } from '../src/setup/verify-permissions.js';
 import { DOC_COMMENT_OAUTH_SCOPES } from '../src/utils/user-token.js';
 
@@ -144,6 +149,35 @@ describe('validateCredentials', () => {
   });
 });
 
+describe('readCriticalScopesFromApplicationInfo', () => {
+  it('uses the effective application-info scopes and reports missing critical names', async () => {
+    fetchMock
+      .mockResolvedValueOnce({ json: async () => ({ code: 0, tenant_access_token: 'tenant-token' }) })
+      .mockResolvedValueOnce({
+        json: async () => ({ code: 0, data: { app: { scopes: [{ scope: 'im:message' }] } } }),
+      });
+    const result = await readCriticalScopesFromApplicationInfo('cli_x', 'secret');
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.granted).toEqual(['im:message']);
+      expect(result.missingCritical.map(scope => scope.name)).toContain('contact:user.base:readonly');
+      expect(result.missingCritical.map(scope => scope.name)).not.toContain('im:message');
+    }
+    expect(fetchMock.mock.calls[1][0]).toContain('/open-apis/application/v6/applications/cli_x');
+  });
+
+  it('fails closed when application self-inspection is unavailable', async () => {
+    fetchMock
+      .mockResolvedValueOnce({ json: async () => ({ code: 0, tenant_access_token: 'tenant-token' }) })
+      .mockResolvedValueOnce({ json: async () => ({ code: 99991672, msg: 'forbidden' }) });
+    expect(await readCriticalScopesFromApplicationInfo('cli_x', 'secret')).toEqual({
+      ok: false,
+      error: 'need_self_manage',
+      message: 'missing application:application:self_manage',
+    });
+  });
+});
+
 describe('checkRequiredScopes (helper, not in main path)', () => {
   it('lists granted scopes and computes missing critical/optional via grant_status===2', async () => {
     scopeListMock.mockResolvedValue({
@@ -245,6 +279,41 @@ describe('deep-link builders', () => {
     expect(steps.length).toBe(2);
     for (const s of steps) expect(s.url).toContain('open.larksuite.com');
   });
+
+  describe('重定向 URL 提示按实际配置生成', () => {
+    // collector 是模块级单例，用完必须还原成「与未注册时等价」的行为（本文件不 import
+    // open-platform-automation，所以未注册状态就等于只有 loopback 那一条），
+    // 否则会泄漏到同文件后续用例。
+    let restore: (() => void) | undefined;
+    afterEach(() => { restore?.(); restore = undefined; });
+
+    it('列出 collectBotmuxRedirectUrls 给的每一条，而不是写死 127.0.0.1', () => {
+      registerBotmuxRedirectUrlCollector(() => [
+        'http://127.0.0.1:9768/callback',
+        'https://m-abc.example.com/oauth/callback',
+      ]);
+      restore = () => registerBotmuxRedirectUrlCollector(() => ['http://127.0.0.1:9768/callback']);
+
+      const redirectStep = buildRemainingSteps('cli_x')[1];
+      // 配了 oauthRedirectBase / 平台绑定 / 反代的机器，真正发起授权用的是
+      // <base>/oauth/callback；只提示 loopback 那条，用户照做完照样 20029。
+      expect(redirectStep.title).toContain('http://127.0.0.1:9768/callback');
+      expect(redirectStep.title).toContain('https://m-abc.example.com/oauth/callback');
+    });
+
+    it('collector 抛错 / 给空数组时回落到 loopback 单条，绝不炸', () => {
+      // buildRemainingSteps 会在「读不到 global-config」的上下文里被调到
+      //（onboarding 落终态），提示生成失败不能反过来把整条链路带崩。
+      registerBotmuxRedirectUrlCollector(() => { throw new Error('config unavailable'); });
+      restore = () => registerBotmuxRedirectUrlCollector(() => ['http://127.0.0.1:9768/callback']);
+
+      expect(() => buildRemainingSteps('cli_x')).not.toThrow();
+      expect(buildRemainingSteps('cli_x')[1].title).toContain('http://127.0.0.1:9768/callback');
+
+      registerBotmuxRedirectUrlCollector(() => []);
+      expect(buildRemainingSteps('cli_x')[1].title).toContain('http://127.0.0.1:9768/callback');
+    });
+  });
 });
 
 describe('BOTMUX_REQUIRED_SCOPES', () => {
@@ -307,5 +376,38 @@ describe('BOTMUX_REQUIRED_SCOPES', () => {
     expect(DOC_FEATURE_SCOPES.map(s => s.name).sort()).toEqual([...DOC_COMMENT_OAUTH_SCOPES].sort());
     // Doc-feature scopes are opt-in → must never be critical (would nag every bot).
     expect(DOC_FEATURE_SCOPES.every(s => !s.critical)).toBe(true);
+    expect(DOC_WATCH_SCOPES.map(s => s.name).sort()).toEqual([
+      'docs:document.comment:create',
+      'docs:document.comment:read',
+      'wiki:wiki:readonly',
+    ]);
+    expect(DOC_WATCH_SCOPES.every(s => !s.critical)).toBe(true);
+  });
+
+  it('VC meeting feature scopes are valid manifest scopes and opt-in only', async () => {
+    const { readFileSync } = await import('node:fs');
+    const { fileURLToPath } = await import('node:url');
+    const { dirname, join } = await import('node:path');
+    const here = dirname(fileURLToPath(import.meta.url));
+    const manifest = JSON.parse(readFileSync(join(here, '..', 'src', 'setup', 'lark-scopes.json'), 'utf-8'));
+    const declared = new Set<string>([...(manifest.scopes?.tenant ?? []), ...(manifest.scopes?.user ?? [])]);
+
+    const missing = VC_MEETING_FEATURE_SCOPES.filter(s => !declared.has(s.name));
+    expect(missing, `VC_MEETING_FEATURE_SCOPES not in lark-scopes.json: ${missing.map(s => s.name).join(', ')}`).toEqual([]);
+    expect(VC_MEETING_FEATURE_SCOPES.map(s => s.name).sort()).toEqual([
+      'vc:meeting.bot.join:write',
+      'vc:meeting.meetingevent:read',
+      'vc:meeting.message:write',
+    ]);
+    expect(VC_MEETING_FEATURE_SCOPES.every(s => !s.critical)).toBe(true);
+  });
+
+  it('VC meeting bot event checklist uses the confirmed Open Platform keys', () => {
+    expect([...VC_MEETING_BOT_EVENTS]).toEqual([
+      'vc.bot.meeting_invited_v1',
+      'vc.bot.meeting_activity_v1',
+      'vc.bot.meeting_ended_v1',
+      'vc.meeting.participant_meeting_joined_v1',
+    ]);
   });
 });

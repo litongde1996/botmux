@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { parseBotConfigsFromText, getOwnerOpenId, registerBot } from '../src/bot-registry.js';
+import { GRANT_DURATION_OPTIONS } from '../src/services/grant-policy.js';
 
 describe('bot-registry grant additions', () => {
   it('parseBotConfigsFromText preserves & filters chatReplyModes (four-state incl. chat-topic)', () => {
@@ -36,6 +37,15 @@ describe('bot-registry grant additions', () => {
     expect(cfgs[0].globalGrants).toEqual(['ou_a', 'ou_b', 'ou_c']);
   });
 
+  it('parseBotConfigsFromText preserves per-bot plugin ids after sanitizing and deduping', () => {
+    const cfgs = parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'plg1',
+      larkAppSecret: 's',
+      plugins: ['agent-chrome', 'bad/id', 'agent-chrome', 'gitlab'],
+    }]));
+    expect(cfgs[0].plugins).toEqual(['agent-chrome', 'gitlab']);
+  });
+
   it('parseBotConfigsFromText leaves globalGrants undefined when absent / all-invalid / non-array', () => {
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'gg2', larkAppSecret: 's' }]))[0].globalGrants).toBeUndefined();
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'gg3', larkAppSecret: 's', globalGrants: [1, 2, ''] }]))[0].globalGrants).toBeUndefined();
@@ -53,6 +63,31 @@ describe('bot-registry grant additions', () => {
     expect(cfgs[1].brandLabel).toBe('');                // '' preserved → off
     expect(cfgs[2].brandLabel).toBe('[Acme](https://acme.test)');
     expect(cfgs[3].brandLabel).toBeUndefined();         // non-string ignored
+  });
+
+  it('parses usageDisplay as a three-state enum, defaulting to streaming and honoring legacy showUsageInCardFooter', () => {
+    const cfgs = parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'usage-default', larkAppSecret: 's' },
+      { larkAppId: 'usage-streaming', larkAppSecret: 's', usageDisplay: 'streaming' },
+      { larkAppId: 'usage-footer', larkAppSecret: 's', usageDisplay: 'footer' },
+      { larkAppId: 'usage-off', larkAppSecret: 's', usageDisplay: 'off' },
+      { larkAppId: 'usage-invalid', larkAppSecret: 's', usageDisplay: 'nonsense' },
+      { larkAppId: 'usage-legacy-off', larkAppSecret: 's', showUsageInCardFooter: false },
+      { larkAppId: 'usage-legacy-on', larkAppSecret: 's', showUsageInCardFooter: true },
+    ]));
+    // Default (unset) and explicit 'streaming' both persist as undefined (default).
+    expect(cfgs[0].usageDisplay).toBeUndefined();
+    expect(cfgs[1].usageDisplay).toBeUndefined();
+    // Non-default modes persist verbatim.
+    expect(cfgs[2].usageDisplay).toBe('footer');
+    expect(cfgs[3].usageDisplay).toBe('off');
+    // Invalid enum falls back to the default (undefined).
+    expect(cfgs[4].usageDisplay).toBeUndefined();
+    // Legacy boolean: false → 'off'; true → default streaming (undefined).
+    expect(cfgs[5].usageDisplay).toBe('off');
+    expect(cfgs[6].usageDisplay).toBeUndefined();
+    // Legacy field is never re-emitted.
+    expect((cfgs[5] as any).showUsageInCardFooter).toBeUndefined();
   });
 
   it('getOwnerOpenId returns first ou_ in resolvedAllowedUsers', () => {
@@ -73,6 +108,25 @@ describe('bot-registry grant additions', () => {
       expect(c[0].messageQuota).toBeUndefined();
     }
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'mq2', larkAppSecret: 's' }]))[0].messageQuota).toBeUndefined();
+  });
+
+  it('parses grantDefaultDurationMs only from the finite card options', () => {
+    for (const durationMs of GRANT_DURATION_OPTIONS) {
+      const config = parseBotConfigsFromText(JSON.stringify([{
+        larkAppId: `gd${durationMs}`,
+        larkAppSecret: 's',
+        grantDefaultDurationMs: durationMs,
+      }]))[0];
+      expect(config.grantDefaultDurationMs).toBe(durationMs);
+    }
+    for (const bad of [undefined, null, '3600000', 0, -1, 2.5, 2 * 60 * 60 * 1000]) {
+      const config = parseBotConfigsFromText(JSON.stringify([{
+        larkAppId: 'gd_bad',
+        larkAppSecret: 's',
+        grantDefaultDurationMs: bad,
+      }]))[0];
+      expect(config.grantDefaultDurationMs).toBeUndefined();
+    }
   });
 
   it('parses & sanitizes quotaState (scope-aware keys + positive int limit, used>=0)', () => {
@@ -114,17 +168,16 @@ describe('bot-registry grant additions', () => {
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'ag4', larkAppSecret: 's', autoGrantRequestCards: 'false' }]))[0].autoGrantRequestCards).toBeUndefined();
   });
 
-  it('parses regularGroupReplyMode: keeps chat-topic|new-topic|shared, drops chat/invalid/absent to undefined', () => {
+  it('parses regularGroupReplyMode: keeps chat|new-topic|shared, drops chat-topic/invalid/absent to undefined', () => {
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg1', larkAppSecret: 's', regularGroupReplyMode: 'new-topic' }]))[0].regularGroupReplyMode).toBe('new-topic');
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg1b', larkAppSecret: 's', regularGroupReplyMode: 'shared' }]))[0].regularGroupReplyMode).toBe('shared');
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg1c', larkAppSecret: 's', regularGroupReplyMode: 'topic_alias' }]))[0].regularGroupReplyMode).toBe('shared');
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg1d', larkAppSecret: 's', regularGroupReplyMode: 'topic' }]))[0].regularGroupReplyMode).toBe('shared');
-    // chat-topic must SURVIVE the load round-trip — regression for the blocker
-    // where the per-bot default loader dropped it back to 'chat' on restart.
-    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg1e', larkAppSecret: 's', regularGroupReplyMode: 'chat-topic' }]))[0].regularGroupReplyMode).toBe('chat-topic');
-    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg1f', larkAppSecret: 's', regularGroupReplyMode: 'chat_topic' }]))[0].regularGroupReplyMode).toBe('chat-topic');
-    // 'chat' is the default → normalized to undefined so bots.json stays clean.
-    for (const bad of ['chat', 'bad', true, 1, undefined]) {
+    // 'chat' must SURVIVE the load round-trip — it is now a NON-default explicit
+    // opt-out (the per-bot default is 'chat-topic'), so it must persist.
+    expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg1e', larkAppSecret: 's', regularGroupReplyMode: 'chat' }]))[0].regularGroupReplyMode).toBe('chat');
+    // 'chat-topic' is the default → normalized to undefined so bots.json stays clean.
+    for (const bad of ['chat-topic', 'chat_topic', 'bad', true, 1, undefined]) {
       const c = parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rg2', larkAppSecret: 's', regularGroupReplyMode: bad }]));
       expect(c[0].regularGroupReplyMode).toBeUndefined();
     }
@@ -147,15 +200,15 @@ describe('bot-registry grant additions', () => {
     expect(cfg.repoPickerMode).toBeUndefined();
   });
 
-	  it('parses p2pMode only as literal chat (else undefined = thread default)', () => {
+	  it('parses p2pMode only as literal thread (else undefined = chat default)', () => {
     const cfgs = parseBotConfigsFromText(JSON.stringify([
       { larkAppId: 'p1', larkAppSecret: 's', p2pMode: 'chat' },
       { larkAppId: 'p2', larkAppSecret: 's', p2pMode: 'thread' },
       { larkAppId: 'p3', larkAppSecret: 's' },
       { larkAppId: 'p4', larkAppSecret: 's', p2pMode: 'invalid' },
     ]));
-    expect(cfgs[0].p2pMode).toBe('chat');
-    expect(cfgs[1].p2pMode).toBeUndefined(); // 'thread' normalizes to undefined
+    expect(cfgs[0].p2pMode).toBeUndefined(); // 'chat' is the default → normalizes to undefined
+    expect(cfgs[1].p2pMode).toBe('thread');  // 'thread' is the explicit opt-out → persists
     expect(cfgs[2].p2pMode).toBeUndefined();
     expect(cfgs[3].p2pMode).toBeUndefined();
   });
@@ -170,6 +223,25 @@ describe('bot-registry grant additions', () => {
     expect(cfgs[0].summaryRange).toEqual({ limit: 0, sinceHours: 0 });
     expect(cfgs[1].summaryRange).toEqual({ limit: 20, sinceHours: 8 });
     expect(cfgs[2].summaryRange).toBeUndefined();
+  });
+
+  it('parses summaryMemory as a default-off boolean', () => {
+    const cfgs = parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'sm1', larkAppSecret: 's', summaryMemory: true, summaryMemoryPath: 'docs/summary.md' },
+      { larkAppId: 'sm2', larkAppSecret: 's', summaryMemory: false, summaryMemoryPath: '/tmp/botmux-summary.md' },
+      { larkAppId: 'sm3', larkAppSecret: 's', summaryMemory: 'true' },
+      { larkAppId: 'sm4', larkAppSecret: 's', summaryMemory: true, summaryMemoryPath: '   ' },
+      { larkAppId: 'sm5', larkAppSecret: 's', summaryMemory: true, summaryMemoryPath: 123 },
+    ]));
+
+    expect(cfgs[0].summaryMemory).toBe(true);
+    expect(cfgs[0].summaryMemoryPath).toBe('docs/summary.md');
+    expect(cfgs[1].summaryMemory).toBeUndefined();
+    expect(cfgs[1].summaryMemoryPath).toBe('/tmp/botmux-summary.md');
+    expect(cfgs[2].summaryMemory).toBeUndefined();
+    expect(cfgs[2].summaryMemoryPath).toBeUndefined();
+    expect(cfgs[3].summaryMemoryPath).toBeUndefined();
+    expect(cfgs[4].summaryMemoryPath).toBeUndefined();
   });
 
   it('parses legacy contentTriggers and preserves explicit unlimited history settings', () => {

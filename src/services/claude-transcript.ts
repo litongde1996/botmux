@@ -17,13 +17,28 @@ import { join } from 'node:path';
 /** Subset of Claude Code's JSONL event shape we care about. */
 export interface TranscriptEvent {
   type?: string;
+  subtype?: string;
   uuid?: string;
   sessionId?: string;
   timestamp?: string;
   message?: {
     role?: string;
     content?: unknown;
+    /** Claude's API stop reason. `tool_use` is an intra-turn pause; terminal
+     * reasons such as `end_turn` / `stop_sequence` close the logical turn. */
+    stop_reason?: string | null;
   };
+  /** API-error records. When the model call fails, Claude Code writes a
+   *  `type:"assistant"` line with `isApiErrorMessage:true` and a machine
+   *  `error` code (e.g. "rate_limit", "server_error", "authentication_failed",
+   *  "unknown") plus the HTTP `apiErrorStatus`. These carry a human-readable
+   *  text block ("You've hit your session limit · resets 10:40pm"), so they
+   *  must be excluded from assistant-reply forwarding (they are not a model
+   *  answer) and, for rate_limit, routed to usage-limit detection instead. */
+  error?: string;
+  errorDetails?: unknown;
+  isApiErrorMessage?: boolean;
+  apiErrorStatus?: number;
   /** Present on `type:"attachment"` lines. The bridge attribution queue
    *  treats `attachment.type === "queued_command"` as a turn-start signal —
    *  Claude writes one of these the moment it dequeues a type-ahead
@@ -36,6 +51,118 @@ export interface TranscriptEvent {
     prompt?: unknown;
     commandMode?: string;
   };
+}
+
+/**
+ * True when an event is Claude Code's structured rate-limit record: an
+ * `isApiErrorMessage` line whose machine `error` code is "rate_limit" (429).
+ * This is the authoritative "we are rate limited" signal — far more reliable
+ * than scraping the TUI, and it lands exactly at the turn's terminal boundary.
+ * The caller turns this into a `limited` session state via
+ * structuredRateLimitState(); it must NOT be forwarded as an assistant reply.
+ */
+export function isTranscriptRateLimitEvent(ev: TranscriptEvent): boolean {
+  if (!ev || typeof ev !== 'object') return false;
+  return ev.error === 'rate_limit' || ev.apiErrorStatus === 429;
+}
+
+/** Concatenated text blocks of an API-error record, used to recover a human
+ *  retry clock ("... resets 10:40pm") when present. Returns '' if none. */
+export function apiErrorMessageText(ev: TranscriptEvent): string {
+  const content = ev.message?.content;
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((b: any) => b && b.type === 'text' && typeof b.text === 'string')
+      .map((b: any) => b.text)
+      .join(' ');
+  }
+  return '';
+}
+
+/** Provider-neutral terminal semantics derived from one Claude transcript
+ * event. The classifier is deliberately fail-closed: an `unknown` API error is
+ * retryable only when its bounded text matches a verified transient signature. */
+export type ClaudeTerminalOutcome =
+  | { status: 'completed' }
+  | { status: 'failed'; errorCode: string; retryable: boolean }
+  | { status: 'ambiguous'; errorCode: string; retryable: false }
+  | { status: 'rate_limited'; errorCode: 'provider_rate_limited'; retryable: false };
+
+function normalizedApiErrorCode(ev: TranscriptEvent): string {
+  return String(ev.error ?? '').trim().toLowerCase();
+}
+
+function hasApiErrorSignature(ev: TranscriptEvent, pattern: RegExp): boolean {
+  return pattern.test(apiErrorMessageText(ev));
+}
+
+export function classifyClaudeTerminalEvent(
+  ev: TranscriptEvent,
+): ClaudeTerminalOutcome | undefined {
+  if (!ev || typeof ev !== 'object' || (ev as any).isSidechain === true) return undefined;
+  if (isTranscriptRateLimitEvent(ev)) {
+    return {
+      status: 'rate_limited',
+      errorCode: 'provider_rate_limited',
+      retryable: false,
+    };
+  }
+  if (ev.isApiErrorMessage === true) {
+    const code = normalizedApiErrorCode(ev);
+    const status = ev.apiErrorStatus;
+    if (code.includes('auth') || status === 401 || status === 407) {
+      return { status: 'failed', errorCode: 'provider_authentication_failed', retryable: false };
+    }
+    if (code.includes('permission') || code.includes('authorization') || status === 403) {
+      return { status: 'failed', errorCode: 'provider_permission_denied', retryable: false };
+    }
+    if (code.includes('invalid') || code.includes('terms')
+      || (typeof status === 'number' && status >= 400 && status <= 499)) {
+      return { status: 'failed', errorCode: 'provider_invalid_request', retryable: false };
+    }
+    if (code.includes('cancel')) {
+      return { status: 'failed', errorCode: 'provider_cancelled', retryable: false };
+    }
+    if (code === 'unknown' && hasApiErrorSignature(ev, /unexpected\s+eof/i)) {
+      return { status: 'failed', errorCode: 'provider_unexpected_eof', retryable: true };
+    }
+    if (code === 'server_error'
+      || (typeof status === 'number' && status >= 500 && status <= 599)
+      || hasApiErrorSignature(ev, /(?:connection\s+(?:reset|lost|closed)|econnreset|http2:\s*client\s+connection\s+lost|closed\s+mid-response|internalserverexception|server\s+unavailable|temporarily\s+unavailable|overload(?:ed)?)/i)) {
+      return { status: 'failed', errorCode: 'provider_server_error', retryable: true };
+    }
+    return { status: 'ambiguous', errorCode: 'provider_unknown_error', retryable: false };
+  }
+  if (ev.type === 'system' && ev.subtype === 'turn_duration') return undefined;
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'assistant') return undefined;
+  const reason = ev.message?.stop_reason;
+  if (typeof reason !== 'string' || reason.length === 0
+    || reason === 'tool_use' || reason === 'pause_turn') return undefined;
+  return { status: 'completed' };
+}
+
+/**
+ * Authoritative Claude Code end-of-turn markers observed in its JSONL:
+ *
+ * - the final non-sidechain assistant message carries a non-tool stop reason;
+ * - current Claude versions additionally append `system/turn_duration`.
+ *
+ * Both may be present for the same turn, so consumers must deduplicate by the
+ * durable turn identity. `tool_use` and `pause_turn` are explicitly excluded:
+ * Claude is waiting on a tool/continuation and has not returned to a new turn.
+ */
+export function isClaudeTurnTerminalEvent(ev: TranscriptEvent): boolean {
+  if (!ev || typeof ev !== 'object' || (ev as any).isSidechain === true) return false;
+  if (ev.type === 'system' && ev.subtype === 'turn_duration') return true;
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'assistant') return false;
+  const reason = ev.message?.stop_reason;
+  return typeof reason === 'string'
+    && reason.length > 0
+    && reason !== 'tool_use'
+    && reason !== 'pause_turn';
 }
 
 /** Extract the user-typed prompt text for a "turn start" event — works for
@@ -156,6 +283,10 @@ export function pickAssistantTextEvents(events: TranscriptEvent[]): TranscriptEv
   return events.filter(e => {
     if (!e || typeof e !== 'object') return false;
     if ((e as any).isSidechain === true) return false;
+    // API-error lines are execution metadata rather than assistant answers.
+    // The bridge emits a structured terminal outcome (or the existing limited
+    // state) and daemon-owned recovery/attention provides user visibility.
+    if (e.isApiErrorMessage === true || isTranscriptRateLimitEvent(e)) return false;
     const role = e.message?.role ?? e.type;
     if (role !== 'assistant') return false;
     if (!e.uuid) return false;
@@ -184,6 +315,83 @@ export function extractAssistantText(event: TranscriptEvent): string {
     }
   }
   return parts.join('\n\n');
+}
+
+/**
+ * Extract the model's thinking (CoT) text from one assistant event. Walks all
+ * `type:'thinking'` blocks in `message.content` and joins them with blank
+ * lines. Returns '' when the event carries no thinking blocks. Sidechain /
+ * error filtering is the caller's job (bridge-turn-queue already applies it
+ * before attribution).
+ */
+export function extractAssistantThinking(event: TranscriptEvent): string {
+  const content = event.message?.content;
+  if (!Array.isArray(content)) return '';
+  const parts: string[] = [];
+  for (const block of content) {
+    if (block && (block as any).type === 'thinking' && typeof (block as any).thinking === 'string' && (block as any).thinking.length > 0) {
+      parts.push((block as any).thinking);
+    }
+  }
+  return parts.join('\n\n');
+}
+
+/** Per-entry truncation caps for the CoT tool timeline. Tool args (Write
+ *  contents, long prompts) and results (file reads, command output) can be
+ *  hundreds of KB — the bubble only needs a recognisable preview. */
+const COT_TOOL_ARGS_MAX_CHARS = 600;
+const COT_TOOL_RESULT_MAX_CHARS = 800;
+
+function truncateForCot(s: string, max: number): string {
+  return s.length > max ? `${s.slice(0, max)}…` : s;
+}
+
+/** One node of the native CoT message. Mirrors `CotEntry` in types.ts —
+ *  redeclared structurally here to keep this module dependency-free. */
+export type TranscriptCotEntry =
+  | { kind: 'thinking'; text: string }
+  | { kind: 'tool_call'; id: string; name: string; args: string }
+  | { kind: 'tool_result'; id: string; result: string };
+
+/** Flatten a tool_result block's content (string, or array of text blocks)
+ *  to a display string. Non-text blocks (images) are skipped. */
+function stringifyToolResultContent(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content
+    .filter((b: any) => b && b.type === 'text' && typeof b.text === 'string')
+    .map((b: any) => b.text)
+    .join('\n');
+}
+
+/**
+ * Extract the CoT (thinking process) entries from one transcript event, in
+ * content-block order:
+ *   - assistant events → `thinking` blocks and `tool_use` blocks
+ *     (id + name + JSON-stringified input, truncated);
+ *   - user events → `tool_result` blocks (tool_use_id + flattened text,
+ *     truncated).
+ * Returns [] for events carrying neither. Sidechain / error filtering is the
+ * caller's job (bridge-turn-queue applies it before attribution).
+ */
+export function extractCotEntries(event: TranscriptEvent): TranscriptCotEntry[] {
+  const content = event.message?.content;
+  if (!Array.isArray(content)) return [];
+  const entries: TranscriptCotEntry[] = [];
+  for (const block of content as any[]) {
+    if (!block || typeof block !== 'object') continue;
+    if (block.type === 'thinking' && typeof block.thinking === 'string' && block.thinking.length > 0) {
+      entries.push({ kind: 'thinking', text: block.thinking });
+    } else if (block.type === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
+      let args = '';
+      try { args = block.input === undefined ? '' : JSON.stringify(block.input); } catch { /* unserialisable input — show none */ }
+      entries.push({ kind: 'tool_call', id: block.id, name: block.name, args: truncateForCot(args, COT_TOOL_ARGS_MAX_CHARS) });
+    } else if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') {
+      const result = stringifyToolResultContent(block.content);
+      entries.push({ kind: 'tool_result', id: block.tool_use_id, result: truncateForCot(result, COT_TOOL_RESULT_MAX_CHARS) });
+    }
+  }
+  return entries;
 }
 
 /** Convenience: filter+extract a list of events into a single concatenated string. */

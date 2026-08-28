@@ -1,16 +1,50 @@
 export type ThemeMode = 'system' | 'light' | 'dark';
 export type ResolvedTheme = 'light' | 'dark';
-export type SessionsViewMode = 'kanban' | 'board' | 'table';
+export type SessionsViewMode = 'kanban' | 'board' | 'topics' | 'table';
 
 export const THEME_STORAGE_KEY = 'botmux.dashboard.theme';
 export const SESSIONS_VIEW_STORAGE_KEY = 'botmux.dashboard.sessions.view';
+export const SESSIONS_SHOW_UNKNOWN_CHATS_STORAGE_KEY = 'botmux.dashboard.sessions.showUnknownChats';
+
+// ── 表格视图列显隐（用户可隐藏部分数据列，选择/操作列固定不可隐藏）──────────
+export const SESSIONS_TABLE_COLUMNS_STORAGE_KEY = 'botmux.dashboard.sessions.tableColumns';
+
+/** 必须存在的列：选择框 + 操作列，永远不可隐藏。 */
+export const FIXED_TABLE_COLUMNS = ['select', 'actions'] as const;
+
+/** 校验存储值：必须是字符串数组，且不包含固定列（固定列不参与持久化）。 */
+export function normalizeHiddenTableColumns(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const fixed = new Set<string>(FIXED_TABLE_COLUMNS);
+  return value
+    .filter((v): v is string => typeof v === 'string' && !fixed.has(v))
+    .filter((v, i, arr) => arr.indexOf(v) === i);
+}
+
+export function readStoredHiddenTableColumns(storage: Storage | undefined): string[] {
+  try {
+    const raw = storage?.getItem(SESSIONS_TABLE_COLUMNS_STORAGE_KEY);
+    if (!raw) return [];
+    return normalizeHiddenTableColumns(JSON.parse(raw));
+  } catch {
+    return [];
+  }
+}
+
+export function writeStoredHiddenTableColumns(storage: Storage | undefined, hidden: string[]): void {
+  try {
+    storage?.setItem(SESSIONS_TABLE_COLUMNS_STORAGE_KEY, JSON.stringify(normalizeHiddenTableColumns(hidden)));
+  } catch {
+    // localStorage 不可用时只在当前页生效
+  }
+}
 
 export function normalizeThemeMode(value: unknown): ThemeMode | null {
   return value === 'system' || value === 'light' || value === 'dark' ? value : null;
 }
 
 export function normalizeSessionsViewMode(value: unknown): SessionsViewMode | null {
-  return value === 'kanban' || value === 'board' || value === 'table' ? value : null;
+  return value === 'kanban' || value === 'board' || value === 'topics' || value === 'table' ? value : null;
 }
 
 export function resolveThemeMode(mode: ThemeMode, systemPrefersDark: boolean): ResolvedTheme {
@@ -28,17 +62,31 @@ export function readStoredSessionsViewMode(storage: Storage | undefined): Sessio
   return normalizeSessionsViewMode(storage?.getItem(SESSIONS_VIEW_STORAGE_KEY)) ?? 'board';
 }
 
+export function readStoredSessionsShowUnknownChats(storage: Storage | undefined): boolean {
+  try {
+    const raw = storage?.getItem(SESSIONS_SHOW_UNKNOWN_CHATS_STORAGE_KEY);
+    return raw == null ? true : raw === '1';
+  } catch {
+    return true;
+  }
+}
+
 // ── 看板列顺序（用户可拖拽/按钮自定义，从左到右）─────────────────────────────
 export const SESSIONS_BOARD_ORDER_STORAGE_KEY = 'botmux.dashboard.sessions.boardOrder';
-export const DEFAULT_BOARD_ORDER = ['needs-you', 'starting', 'working', 'idle'] as const;
+export const DEFAULT_BOARD_ORDER = ['needs-you', 'working', 'todo', 'idle'] as const;
 
-/** 必须是默认四列的一个排列（防旧版本残留/手改 localStorage 的脏值）。 */
+/** 必须是默认四列的一个排列（防旧版本残留/手改 localStorage 的脏值）。
+ *  兼容旧存值：老版本存过含 'starting' 的四列（needs-you/starting/working/idle）——
+ *  'starting' 已并入 'working'，先剔除；缺失的新列 'todo' 补到末尾，避免整体被丢弃回默认。 */
 export function normalizeBoardOrder(value: unknown): string[] | null {
-  if (!Array.isArray(value) || value.length !== DEFAULT_BOARD_ORDER.length) return null;
-  const seen = new Set(value);
-  if (seen.size !== value.length) return null;
+  if (!Array.isArray(value)) return null;
+  const migrated = value.filter(id => id !== 'starting');
+  for (const id of DEFAULT_BOARD_ORDER) if (!migrated.includes(id)) migrated.push(id);
+  if (migrated.length !== DEFAULT_BOARD_ORDER.length) return null;
+  const seen = new Set(migrated);
+  if (seen.size !== migrated.length) return null;
   for (const id of DEFAULT_BOARD_ORDER) if (!seen.has(id)) return null;
-  return value.slice();
+  return migrated.slice();
 }
 
 export function readStoredBoardOrder(storage: Storage | undefined): string[] {
@@ -67,6 +115,33 @@ export function writeStoredSessionsViewMode(storage: Storage | undefined, mode: 
   }
 }
 
+export function writeStoredSessionsShowUnknownChats(storage: Storage | undefined, show: boolean): void {
+  try {
+    storage?.setItem(SESSIONS_SHOW_UNKNOWN_CHATS_STORAGE_KEY, show ? '1' : '0');
+  } catch {
+    // localStorage 不可用时只在当前页生效
+  }
+}
+
+// ── 创建会话弹窗「连续创建」开关（创建成功后不关闭弹窗）────────────────────────
+export const SESSIONS_CREATE_KEEP_OPEN_STORAGE_KEY = 'botmux.dashboard.sessions.createKeepOpen';
+
+export function readStoredCreateKeepOpen(storage: Storage | undefined): boolean {
+  try {
+    return storage?.getItem(SESSIONS_CREATE_KEEP_OPEN_STORAGE_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+export function writeStoredCreateKeepOpen(storage: Storage | undefined, keepOpen: boolean): void {
+  try {
+    storage?.setItem(SESSIONS_CREATE_KEEP_OPEN_STORAGE_KEY, keepOpen ? '1' : '0');
+  } catch {
+    // localStorage 不可用时只在当前页生效
+  }
+}
+
 // ── 看板分组维度：工作流列 / 团队（筛选某团队的工作流）/ 机器人列 ─────────────
 export type KanbanGroupBy = 'flow' | 'team' | 'bot';
 
@@ -89,27 +164,6 @@ export function writeStoredKanbanGroupBy(storage: Storage | undefined, mode: Kan
   }
 }
 
-// ── 左侧菜单栏收起/展开 ───────────────────────────────────────────────────────
-export type SidebarMode = 'expanded' | 'collapsed';
-
-export const SIDEBAR_STORAGE_KEY = 'botmux.dashboard.sidebar';
-
-export function normalizeSidebarMode(value: unknown): SidebarMode | null {
-  return value === 'expanded' || value === 'collapsed' ? value : null;
-}
-
-export function readStoredSidebarMode(storage: Storage | undefined): SidebarMode {
-  return normalizeSidebarMode(storage?.getItem(SIDEBAR_STORAGE_KEY)) ?? 'expanded';
-}
-
-export function writeStoredSidebarMode(storage: Storage | undefined, mode: SidebarMode): void {
-  try {
-    storage?.setItem(SIDEBAR_STORAGE_KEY, mode);
-  } catch {
-    // localStorage 不可用时只在当前页生效
-  }
-}
-
 // ── Skin (visual identity, orthogonal to light/dark) ──────────────────────────
 // `default` = the regular botmux look (honours the light/dark theme mode).
 // Every other id is a self-contained palette distilled from the kaboo webui; each
@@ -118,24 +172,12 @@ export function writeStoredSidebarMode(storage: Storage | undefined, mode: Sideb
 export type SkinId =
   | 'default'
   | 'cyber'
-  | 'genshin'
-  | 'fallout'
-  | 'prts'
-  | 'bluearchive'
-  | 'zzz'
-  | 'dragonball'
-  | 'ikun';
+  | 'fallout';
 
 export const SKIN_IDS: readonly SkinId[] = [
   'default',
   'cyber',
-  'genshin',
   'fallout',
-  'prts',
-  'bluearchive',
-  'zzz',
-  'dragonball',
-  'ikun',
 ];
 
 export const SKIN_STORAGE_KEY = 'botmux.dashboard.skin';

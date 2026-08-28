@@ -2,19 +2,43 @@
 
 > Compiled from the README and high-frequency questions in the community group, and continuously expanded. For more pitfalls, see [Common Pitfalls](/en/pitfalls).
 
-## The bot receives no messages at all — what do I do?
+## Troubleshooting "the bot doesn't reply" (the #1 question)
+
+Match your **symptom** first — the root cause differs:
+
+| Symptom | Likely cause | Jump |
+|------|-----------|------|
+| **No reaction at all** (not even an emoji) | Event subscription / release / long connection not working | [A. No messages received at all](#a-no-messages-received-at-all) |
+| Only **I (owner)** can trigger it; others get an auth card / no reply | Only operate permission granted, no talk permission | [B. Others can't use it / auth card](#b-others-cant-use-it--auth-card) |
+| Must **@ it** to get a reply / want auto-reply without @ | Group @ policy | [B. Others can't use it / auth card](#b-others-cant-use-it--auth-card) |
+| Shows 🟡 "working" but **the result never comes back** (terminal has output) | Terminal CLI session: model didn't call `botmux send` (`codex-app` auto-forwards — it's the exception) | [C. Terminal has output but nothing sent to Lark](#c-terminal-has-output-but-nothing-sent-to-lark) |
+| Session **won't start** / first message errors `zsh: parse error` | Login shell startup file jumps shells | [Session won't start](#sessions-never-start--the-first-message-errors-with-zsh-parse-error-near-n) |
+
+### A. No messages received at all
 
 Check these in order (PersonalAgent comes configured correctly by default; normally you don't need to touch it):
 
-1. **Event subscription**: Open Platform → Events & Callbacks → you should subscribe to `im.message.receive_v1` + `card.action.trigger`, with the delivery method set to "Long connection (WebSocket)", and the daemon must be running.
+1. **Event subscription**: Open Platform → Events & Callbacks → subscribe to `im.message.receive_v1` + `card.action.trigger`, with delivery method "Long connection (WebSocket)", and the daemon must be running.
 2. **Bot capability**: Open Platform → App Features → Bot should already be enabled.
-3. **Release**: The app must have a version created and published (availability "visible only to myself" passes automatically).
-4. **Exclusive long connection**: Confirm this bot isn't having its long connection grabbed by another app at the same time.
+3. **Release**: the app must have a version created and published (availability "visible only to myself" passes automatically). After changing permissions / events you **must re-publish** for them to take effect.
+4. **Exclusive long connection**: confirm this bot isn't having its long connection grabbed by another app.
 5. After confirming, run `botmux restart` (from a clean shell).
 
-## The bot has output in the terminal, but nothing was sent to Lark?
+> To have an agent triage it, see [Common Pitfalls · General troubleshooting approach](/en/pitfalls#general-troubleshooting-approach) (`botmux logs` to find the spawn command and reproduce locally + the web terminal for the real error).
 
-Terminal stdout ≠ sent to Lark. You must explicitly run `botmux send` (with one of `--mention-back` / `--mention` / `--no-mention`) for the group to see it. If the model only `echo`s/`print`s or forgets to call `botmux send`, nothing goes out. Use a heredoc for multi-line content; don't write it as `"line one\nline two"`.
+### B. Others can't use it / auth card
+
+botmux has two permission layers (see [permissions](#how-are-permissions-divided-who-can-operate-it)): **talk permission** (who can ask) and **operate permission** (who can `/cd` `/restart` / tap buttons). By default only the owner has talk permission, so others get refused / see an auth card.
+
+- **Let a whole group use it**: give the bot `allowedChatGroups` (everyone in that group can talk), or authorize a specific group with `/grant`.
+- **Group @ policy** (must-@ vs no-@): multi-person groups require @ by default; no-@-in-topic / no-@-whole-group can be configured in the group @ policy. Note a 1-on-1 "you + 1 bot" group is @-free already.
+- **On-call scenario** (a new group per ticket, everyone asks @-free): see [On-Call Mode](/en/oncall).
+
+### C. Terminal has output but nothing sent to Lark
+
+**This applies only to terminal CLI sessions that require explicit sending** (Claude Code / Codex CLI / Gemini / CoCo, etc.): terminal stdout ≠ sent to Lark, so the model must explicitly run `botmux send` (with one of `--mention-back` / `--mention` / `--no-mention`) for the group to see it. Just `echo`ing/`print`ing or forgetting `botmux send` means nothing goes out. Use a heredoc for multi-line content; don't write it as `"line one\nline two"`.
+
+> ⚠️ **Exception: `codex-app` (Codex App app-server protocol)** — its final assistant message is **auto-forwarded** back to Lark by botmux, so **don't call `botmux send` for normal replies** (that would double-send); use it only for mid-turn pushes / attachments / cross-bot @mentions.
 
 ## `botmux history` reports 400 / Lark gateway 411?
 
@@ -28,17 +52,36 @@ First figure out which `/login` it is:
 - **Lark-side App Token rejected when calling the API**: Send `/login` in the topic → click the authorization link → copy the callback URL the browser redirects to (`http://127.0.0.1:9768/callback?...`; it's normal for the page not to load) back into the topic.
 - **Model-gateway-side 403**: This is unrelated to Lark authorization and is usually an environment-variable / gateway-token issue. A common root cause is bash users putting variables in `.bash_profile` where `bash -i` doesn't read them (see [Common Pitfalls](/en/pitfalls)).
 
+**macOS note: claude's login token has two stores — keychain and file — and a split between them is the main reason claude shows `Please run /login` on macOS.**
+
+- **keychain** (the keychain item `Claude Code-credentials`): used by **claude running in the GUI** and by **botmux's default (non-isolated) config**;
+- **file** (`~/.claude/.credentials.json`): running `/login` over **SSH can only write here**.
+
+The catch: **as long as the keychain item exists, claude reads the token from the keychain and never reads the file** — even when the file holds the freshly updated token. So you get "SSH `/login` clearly succeeded (it only wrote the file), yet the GUI / non-isolated bot still reads the stale keychain token and says `Please run /login`." On top of that, claude rotates the refresh token on each refresh, so whichever process refreshes first invalidates the other's token, dropping everyone's login.
+
+**Recommended (converge onto the file as the single source):**
+
+1. **Don't use claude code in the GUI** — the GUI writes / refreshes the token into the keychain, creating a second source out of nowhere;
+2. **Update the token by running `/login` over SSH**, so both SSH and botmux use the file as the login-token source;
+3. If a stale keychain item already exists, delete it to converge onto the single file source.
+
 ## Does it support Lark (international, larksuite.com)?
 
 Yes. Both Feishu (feishu.cn) and Lark (international, larksuite.com) work: when you scan to create an app, the tenant type (China / international) is **detected automatically** and remembered; when you paste the AppID/Secret manually, it asks you to choose once. Each bot independently connects to the corresponding domain based on its edition, and the same machine can run Feishu and Lark bots simultaneously, with login credentials isolated per app and not interfering with each other.
 
 ## How do multiple bots collaborate with each other?
 
-First run `@botA @botB /introduce` to register each other's open_id; afterwards, use `botmux send --mention <the other's open_id>` to explicitly trigger the other bot. Without `--mention`, the other bot won't be triggered.
+**It works by default — no extra setup.** Just add the bots you want to collaborate to the same group.
+
+- **Just you and one bot**: talk to it directly; it responds automatically, no @ needed.
+- **A group with multiple bots / people**: @ the bot you want to hand the work to.
+- When bots need to relay (e.g. one writes, one reviews), the bots @ each other to pass it along — you just hand the work to the first one.
+
+See [Multi-bot Collaboration](/en/multi-bot) for details.
 
 ## Does restarting the daemon lose context?
 
-With **tmux** installed, no — the CLI process stays resident in a tmux session, and after `botmux restart` the next message automatically re-attaches, with no need for `--resume`. Without tmux, it runs in pty mode, and a restart reloads everything.
+With **tmux** installed, no — tmux is the default backend, the CLI process stays resident in a tmux session, and after `botmux restart` the next message automatically re-attaches, with no need for `--resume`. ⚠️ Without tmux it does **not** silently downgrade to pty; it hard-gates and posts a card asking you to install tmux. Only an explicit `BACKEND_TYPE=pty` (or per-bot `backendType:"pty"`) uses pty, and pty sessions **do not survive daemon restarts** — a restart reloads everything.
 
 ## Does a session keep running if I don't close it? Is there automatic reclamation?
 
@@ -74,10 +117,10 @@ botmux launches the session inside tmux via `<$SHELL> -i -c '… start the CLI'`
 
 Since v2.95.0 botmux detects this "the session never really started" state and posts a diagnostic card instead of typing the message into the bare shell. Two ways to fix it:
 
-- **Set `launchShell` (recommended)**: tell the bot to launch directly under the target shell, bypassing the trampolining startup file. `/config launchShell zsh`, or the dashboard ("Bot defaults → Launch shell"), or add `"launchShell": "zsh"` to `bots.json`. Note: PATH / nvm etc. must then live in the chosen shell's startup files (e.g. `.zshrc`).
+- **Set `launchShell` (recommended)**: tell the bot to launch directly under the target shell, bypassing the trampolining startup file. `/config launchShell zsh`, or the dashboard ("Bot defaults → Launch shell"), or add `"launchShell": "zsh"` to `bots.json`. Note: PATH / nvm etc. must then live in the chosen shell's startup files (e.g. `.zshrc`, or `~/.config/fish/config.fish` for fish, which is supported as a first-class launch shell).
 - **Fix the startup file**: guard the switch so it only fires for a real interactive terminal: `[ -z "$BASH_EXECUTION_STRING" ] && [ -t 1 ] && exec zsh` (put PATH / nvm exports before it).
 
-Then `botmux restart` and resend a message. Only the `tmux` / `zellij` backends are affected; the `pty` backend launches the CLI directly and is immune.
+Then `botmux restart` and resend a message. This affects shell-wrapped persistent backends (`tmux` / `zellij` / `zmx`); the `pty` backend launches the CLI directly and is immune.
 
 ## Can a bot added to a new group see the earlier chat history?
 

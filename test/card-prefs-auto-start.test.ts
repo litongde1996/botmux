@@ -61,8 +61,9 @@ describe('card-prefs store — 主动开工 fields', () => {
     const prefs = store.getBotCardPrefs('app_default');
     expect(prefs.autoStartOnGroupJoin).toBe(false);
     expect(prefs.autoStartOnNewTopic).toBe(false);
+    expect(prefs.codexAppCleanInput).toBe(false);
     expect(prefs.autoStartOnGroupJoinPrompt).toBe('');
-    expect(prefs.regularGroupReplyMode).toBe('chat');
+    expect(prefs.regularGroupReplyMode).toBe('chat-topic');
     expect(prefs.regularGroupMentionMode).toBe('always');
   });
 
@@ -124,6 +125,25 @@ describe('card-prefs store — 主动开工 fields', () => {
     expect(registry.getBot('app_default').config.silentTurnReactions).toBeUndefined();
   });
 
+  it('codexAppCleanInput is default-off and round-trips without a restart', async () => {
+    writeConfig({ cliId: 'codex-app' });
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    expect(store.getBotCardPrefs('app_default').codexAppCleanInput).toBe(false);
+
+    const on = await store.updateBotCardPrefs('app_default', { codexAppCleanInput: true });
+    expect(on.ok && on.prefs.codexAppCleanInput).toBe(true);
+    expect(readConfig().codexAppCleanInput).toBe(true);
+    expect(registry.getBot('app_default').config.codexAppCleanInput).toBe(true);
+
+    // Turning it back off restores the legacy default and removes the key.
+    const off = await store.updateBotCardPrefs('app_default', { codexAppCleanInput: false });
+    expect(off.ok && off.prefs.codexAppCleanInput).toBe(false);
+    expect(readConfig().codexAppCleanInput).toBeUndefined();
+    expect(registry.getBot('app_default').config.codexAppCleanInput).toBeUndefined();
+  });
+
   it('botToBotSameDir is default-TRUE: persists only explicit false, clears on true', async () => {
     writeConfig();
     const { registry, store } = await freshModules();
@@ -159,13 +179,14 @@ describe('card-prefs store — 主动开工 fields', () => {
       autoStartOnGroupJoin: false,
       autoStartOnGroupJoinPrompt: '   ',
       autoStartOnNewTopic: false,
-      regularGroupReplyMode: 'chat',
+      regularGroupReplyMode: 'chat-topic',
     });
 
     const disk = readConfig();
     expect(disk.autoStartOnGroupJoin).toBeUndefined();
     expect(disk.autoStartOnNewTopic).toBeUndefined();
     expect(disk.autoStartOnGroupJoinPrompt).toBeUndefined();
+    // 'chat-topic' is now the default → cleared to undefined so bots.json stays tidy.
     expect(disk.regularGroupReplyMode).toBeUndefined();
 
     const cfg = registry.getBot('app_default').config;

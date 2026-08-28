@@ -6,7 +6,7 @@
  * buildNewTopicPrompt injects a <role> block when given { larkAppId, chatId }.
  * Run: pnpm vitest run test/role-resolver.test.ts
  */
-import { mkdtempSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -58,11 +58,123 @@ describe('role-resolver storage', () => {
     expect(deleteRoleFile('app1', 'oc_y')).toBe(false); // already gone
   });
 
-  it('truncates content to 4 KB by UTF-8 byte length (CJK is 3 bytes)', async () => {
-    const { writeRoleFile, resolveRoleFile } = await fresh();
-    writeRoleFile('app1', 'oc_big', '中'.repeat(2000)); // 6000 bytes
+  it('truncates content to MAX_ROLE_BYTES by UTF-8 byte length, on a char boundary', async () => {
+    const { writeRoleFile, resolveRoleFile, MAX_ROLE_BYTES } = await fresh();
+    // Write well over the limit in CJK (3 bytes each) so truncation must fire.
+    const overCount = Math.ceil(MAX_ROLE_BYTES / 3) + 1000;
+    writeRoleFile('app1', 'oc_big', '中'.repeat(overCount));
     const got = resolveRoleFile('app1', 'oc_big')!;
-    expect(Buffer.byteLength(got, 'utf-8')).toBeLessThanOrEqual(4096);
+    expect(Buffer.byteLength(got, 'utf-8')).toBeLessThanOrEqual(MAX_ROLE_BYTES);
+    // No partial/replacement char at the cut (would appear as U+FFFD).
+    expect(got).not.toContain('�');
+    // The raised limit is well above the old 4 KB.
+    expect(MAX_ROLE_BYTES).toBeGreaterThan(4096);
+  });
+});
+
+describe('role injection mode', () => {
+  it('defaults to "every" and round-trips "once" / back to "every"', async () => {
+    const { readRoleInjectMode, writeRoleInjectMode } = await fresh();
+    expect(readRoleInjectMode('app1', 'oc_m')).toBe('every');
+    writeRoleInjectMode('app1', 'oc_m', 'once');
+    expect(readRoleInjectMode('app1', 'oc_m')).toBe('once');
+    writeRoleInjectMode('app1', 'oc_m', 'every'); // removes the sidecar
+    expect(readRoleInjectMode('app1', 'oc_m')).toBe('every');
+  });
+
+  it('resolveRoleInjection carries the mode alongside the effective role', async () => {
+    const { writeRoleFile, writeTeamRoleFile, writeRoleInjectMode, resolveRoleInjection } = await fresh();
+    // No role → injectMode is 'every' regardless.
+    expect(resolveRoleInjection('app1', 'oc_r')).toEqual({ content: null, source: 'none', injectMode: 'every' });
+    // Mode applies to the team default too (per-chat setting, not per-source).
+    writeTeamRoleFile('app1', 'TEAM');
+    writeRoleInjectMode('app1', 'oc_r', 'once');
+    expect(resolveRoleInjection('app1', 'oc_r')).toEqual({ content: 'TEAM', source: 'team', injectMode: 'once' });
+    // A per-chat override wins for content; mode is unchanged.
+    writeRoleFile('app1', 'oc_r', 'CHAT');
+    expect(resolveRoleInjection('app1', 'oc_r')).toEqual({ content: 'CHAT', source: 'chat', injectMode: 'once' });
+  });
+
+  it('stores the dispatch completion switch per bot + chat without clobbering injection mode', async () => {
+    const {
+      deleteRoleMeta,
+      readRoleDispatchCompletionEnabled,
+      readRoleInjectMode,
+      writeRoleDispatchCompletionEnabled,
+      writeRoleInjectMode,
+    } = await fresh();
+    const metaPath = join(dataDir, 'roles', 'app1', 'oc_dispatch.meta.json');
+
+    expect(readRoleDispatchCompletionEnabled('app1', 'oc_dispatch')).toBe(false);
+    writeRoleInjectMode('app1', 'oc_dispatch', 'once');
+    writeRoleDispatchCompletionEnabled('app1', 'oc_dispatch', true);
+    expect(readRoleInjectMode('app1', 'oc_dispatch')).toBe('once');
+    expect(readRoleDispatchCompletionEnabled('app1', 'oc_dispatch')).toBe(true);
+
+    writeRoleDispatchCompletionEnabled('app1', 'oc_dispatch', false);
+    expect(readRoleInjectMode('app1', 'oc_dispatch')).toBe('once');
+    expect(readRoleDispatchCompletionEnabled('app1', 'oc_dispatch')).toBe(false);
+
+    writeRoleDispatchCompletionEnabled('app1', 'oc_dispatch', true);
+    deleteRoleMeta('app1', 'oc_dispatch');
+    expect(existsSync(metaPath)).toBe(false);
+    expect(readRoleInjectMode('app1', 'oc_dispatch')).toBe('every');
+    expect(readRoleDispatchCompletionEnabled('app1', 'oc_dispatch')).toBe(false);
+  });
+
+  it('treats damaged or non-object role metadata as empty', async () => {
+    const {
+      readRoleDispatchCompletionEnabled,
+      readRoleInjectMode,
+      writeRoleInjectMode,
+    } = await fresh();
+    const metaPath = join(dataDir, 'roles', 'app1', 'oc_invalid_meta.meta.json');
+    writeRoleInjectMode('app1', 'oc_invalid_meta', 'once');
+
+    for (const invalid of ['null', '[]', '{']) {
+      writeFileSync(metaPath, invalid);
+      expect(readRoleInjectMode('app1', 'oc_invalid_meta')).toBe('every');
+      expect(readRoleDispatchCompletionEnabled('app1', 'oc_invalid_meta')).toBe(false);
+    }
+  });
+
+  it('falls back to the bot-level default injection mode when a chat has none', async () => {
+    const { readRoleInjectMode, readTeamRoleInjectMode, writeTeamRoleInjectMode, writeRoleInjectMode } = await fresh();
+    // bot-level default itself defaults to 'every' (legacy).
+    expect(readTeamRoleInjectMode('appB')).toBe('every');
+    expect(readRoleInjectMode('appB', 'oc_x')).toBe('every');
+    // Opt the whole bot into 'once' → any chat without its own sidecar inherits it.
+    writeTeamRoleInjectMode('appB', 'once');
+    expect(readTeamRoleInjectMode('appB')).toBe('once');
+    expect(readRoleInjectMode('appB', 'oc_x')).toBe('once');
+    expect(readRoleInjectMode('appB', 'oc_y')).toBe('once');
+    // A per-chat sidecar still wins over the bot default.
+    writeRoleInjectMode('appB', 'oc_x', 'once');   // explicit once (same value)
+    expect(readRoleInjectMode('appB', 'oc_x')).toBe('once');
+    // Clearing the bot default returns unset chats to 'every'.
+    writeTeamRoleInjectMode('appB', 'every');       // removes the meta sidecar
+    expect(readRoleInjectMode('appB', 'oc_y')).toBe('every');
+  });
+
+  it('buildFollowUpContent omits the <role> block when mode is "once", keeps it on "every"', async () => {    await fresh();
+    const { writeRoleFile, writeRoleInjectMode } = await import('../src/core/role-resolver.js');
+    writeRoleFile('app1', 'oc_once', 'ONCE_PERSONA');
+    const { buildNewTopicPrompt, buildFollowUpContent } = await import('../src/core/session-manager.js');
+
+    // every (default): role present in both opening + follow-up
+    expect(buildFollowUpContent('hi', 's1', { larkAppId: 'app1', chatId: 'oc_once' })).toContain('ONCE_PERSONA');
+
+    // once: opening keeps it, follow-up drops it
+    writeRoleInjectMode('app1', 'oc_once', 'once');
+    const opening = buildNewTopicPrompt(
+      'hi', 's1', 'claude-code', undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      { larkAppId: 'app1', chatId: 'oc_once' },
+    );
+    expect(opening).toContain('ONCE_PERSONA');
+    const followUp = buildFollowUpContent('hi again', 's1', { larkAppId: 'app1', chatId: 'oc_once' });
+    expect(followUp).not.toContain('ONCE_PERSONA');
+    expect(followUp).not.toContain('<role');
   });
 });
 

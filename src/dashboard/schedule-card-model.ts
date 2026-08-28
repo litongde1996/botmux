@@ -16,6 +16,7 @@
 
 import { Cron } from 'croner';
 import type { ParsedSchedule } from '../types.js';
+import { scheduleTimeZone } from '../utils/timezone.js';
 import type {
   ButtonState,
   PaginationMeta,
@@ -23,7 +24,6 @@ import type {
   StatusDot,
 } from './card-model-types.js';
 
-const DEFAULT_TIMEZONE = 'Asia/Shanghai';
 const DEFAULT_PAGE_SIZE = 20;
 const MAX_PAGE_SIZE = 100;
 const DEFAULT_PROMPT_TRUNCATE = 200;
@@ -44,6 +44,10 @@ export interface ScheduleCardTaskInput {
    *  when missing. */
   botName?: string;
   chatId?: string;
+  rootMessageId?: string;
+  scope?: 'thread' | 'chat';
+  executionPosition?: 'top-level' | 'topic' | 'new-topic';
+  topicTitle?: string;
   /** ISO of the next scheduled run (precomputed by caller). */
   nextRunAt?: string;
   /** ISO of the last completed run. */
@@ -53,10 +57,14 @@ export interface ScheduleCardTaskInput {
    *  `times === null` ⇒ forever; finite `times` ⇒ auto-removes after N runs.
    *  `completed` counts how many runs have fired. */
   repeat?: { times: number | null; completed: number };
+  /** Silent fires (no start banner, model decides whether to send). A fresh
+   *  topic is materialized lazily by the first botmux send. */
+  silent?: boolean;
 }
 
 export type ScheduleKind = ParsedSchedule['kind'];
 export type ScheduleDelivery = 'origin' | 'local' | 'new-topic';
+export type ScheduleExecutionPlacement = 'chat' | 'thread' | 'new-topic' | 'local';
 export type ScheduleKindChip = ScheduleKind | 'all';
 
 export interface ScheduleFilterQuery extends PaginationParams {
@@ -69,7 +77,7 @@ export interface ScheduleFilterQuery extends PaginationParams {
 export interface RowRenderContext {
   /** Epoch ms — required so relative-time outputs are deterministic. */
   nowMs: number;
-  /** IANA timezone for cron next-run math; defaults to 'Asia/Shanghai'. */
+  /** IANA timezone for cron next-run math; defaults to the host's local zone (scheduleTimeZone()). */
   timezone?: string;
   /** Cap prompt length in detail DTO; defaults to 200. */
   promptTruncateAt?: number;
@@ -112,6 +120,7 @@ export interface ScheduleDetailDto {
   kind: ScheduleKind;
   displayExpr: string;
   deliver: ScheduleDelivery;
+  executionPlacement: ScheduleExecutionPlacement;
   prompt?: string;
   /** True when prompt was longer than promptTruncateAt and got cut. */
   promptTruncated: boolean;
@@ -200,23 +209,50 @@ export function normalizeScheduleDelivery(deliver: ScheduleCardTaskInput['delive
   return deliver === 'new-topic' || deliver === 'local' ? deliver : 'origin';
 }
 
+/** Resolve the user-facing execution position from the captured session anchor. */
+export function resolveScheduleExecutionPlacement(
+  task: Pick<ScheduleCardTaskInput, 'deliver' | 'scope' | 'rootMessageId' | 'executionPosition'>,
+): ScheduleExecutionPlacement {
+  if (task.deliver === 'local') return 'local';
+  if (task.executionPosition === 'new-topic' || (!task.executionPosition && task.deliver === 'new-topic')) return 'new-topic';
+  if (task.executionPosition === 'topic') return task.rootMessageId ? 'thread' : 'chat';
+  if (task.executionPosition === 'top-level') return 'chat';
+  if (task.scope === 'chat') return 'chat';
+  return task.rootMessageId ? 'thread' : 'chat';
+}
+
 export function computeDeliveryButtonAvailability(
   task: ScheduleCardTaskInput,
-  target: Exclude<ScheduleDelivery, 'local'>,
+  target: 'top-level' | 'topic' | 'new-topic',
 ): ButtonState {
-  const current = normalizeScheduleDelivery(task.deliver);
-  if (current === 'local') {
+  if (task.deliver === 'local') {
     return { enabled: false, reasonKey: 'schedules.action.delivery.local' };
+  }
+  const placement = resolveScheduleExecutionPlacement(task);
+  const current = placement === 'thread' ? 'topic' : placement === 'new-topic' ? 'new-topic' : 'top-level';
+  if (target === 'topic' && !task.rootMessageId) {
+    return { enabled: false, reasonKey: 'schedules.action.delivery.topicRootRequired' };
   }
   if (current === target) {
     return {
       enabled: false,
-      reasonKey: target === 'origin'
+      reasonKey: target === 'topic'
         ? 'schedules.action.delivery.alreadyOrigin'
-        : 'schedules.action.delivery.alreadyNewTopic',
+        : target === 'top-level'
+          ? 'schedules.action.delivery.alreadyTopLevel'
+          : 'schedules.action.delivery.alreadyNewTopic',
     };
   }
   return { enabled: true };
+}
+
+export function nextScheduleExecutionPosition(task: ScheduleCardTaskInput): 'top-level' | 'topic' | 'new-topic' {
+  const placement = resolveScheduleExecutionPlacement(task);
+  if (placement === 'thread') return 'top-level';
+  // Leaving a fresh topic parks at top level — never cycle back into a
+  // retained root, which may belong to the adopted topic the task was born in.
+  if (placement === 'new-topic') return 'top-level';
+  return 'new-topic';
 }
 
 /** Build a single ScheduleRowDto for list rendering. */
@@ -252,6 +288,7 @@ export function toScheduleDetailDto(task: ScheduleCardTaskInput, ctx: RowRenderC
     kind: task.parsed.kind,
     displayExpr: task.parsed.display,
     deliver: normalizeScheduleDelivery(task.deliver),
+    executionPlacement: resolveScheduleExecutionPlacement(task),
     prompt: promptRaw.length === 0 ? undefined : prompt,
     promptTruncated,
     chatId: task.chatId,
@@ -273,9 +310,10 @@ export function toScheduleDetailDto(task: ScheduleCardTaskInput, ctx: RowRenderC
  *  - `once`:  one entry if `runAt >= nowMs` AND `lastRunAt` is absent; else [].
  *  - `interval`: minutes>0 required; base = lastRunAt ?? nowMs; aligns to first
  *               future run > nowMs.
- *  - `cron`:  uses `croner` with `Asia/Shanghai` (or override) timezone.
+ *  - `cron`:  uses `croner` with the host's local timezone (or an injected override).
  *
- * Pure: nowMs + timezone injected; no implicit clock reads.
+ * Pure w.r.t. the clock: nowMs is injected. `timezone` is injected too; when
+ * omitted it falls back to the host's local zone (scheduleTimeZone()).
  */
 export function computeNextNRuns(
   task: ScheduleCardTaskInput,
@@ -283,7 +321,7 @@ export function computeNextNRuns(
   ctx: { nowMs: number; timezone?: string },
 ): string[] {
   if (n <= 0) return [];
-  const tz = ctx.timezone ?? DEFAULT_TIMEZONE;
+  const tz = ctx.timezone ?? scheduleTimeZone();
   const { parsed } = task;
 
   if (parsed.kind === 'once') {

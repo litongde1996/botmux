@@ -2,6 +2,8 @@
 // 协作提示的 prompt 组装、会话标题推导。与 DOM / Lark API / 进程管理解耦，便于
 // 单测。daemon 侧 /api/sessions/spawn 与 session-manager 的 spawn/activate 复用。
 import { t, type Locale } from '../i18n/index.js';
+import type { CliTurnPayload } from '../types.js';
+import { parseDashboardImageUploads, type DashboardImageUpload } from './dashboard-images.js';
 
 /** 协作模式：
  *  - 'all'  「一起开工」——每个被选 bot 各起一条会话、拿同一份内容。
@@ -55,6 +57,26 @@ export function deriveSessionTitleFromContent(content: string): string {
   return firstLine.length > TITLE_MAX ? firstLine.slice(0, TITLE_MAX) + '…' : firstLine;
 }
 
+/** Dashboard group name follows the same visible first-line rule as the
+ * session title. Keeping it here prevents the browser placeholder and the
+ * actual Lark chat name from drifting apart. */
+export function deriveCreateGroupName(explicitName: unknown, content: string): string {
+  if (typeof explicitName === 'string' && explicitName.trim()) return explicitName.trim().slice(0, 60);
+  return deriveSessionTitleFromContent(content).slice(0, 60);
+}
+
+/** Decide which already-joined bots receive the opening turn. The content is
+ * intentionally absent from this decision: an @sub inside Lead instructions
+ * must not wake that sub before the Lead delegates. */
+export function selectCreateSessionTargets(
+  mode: CreateSessionMode,
+  joinedIds: readonly string[],
+  leadLarkAppId?: string,
+): string[] {
+  if (mode === 'lead') return leadLarkAppId && joinedIds.includes(leadLarkAppId) ? [leadLarkAppId] : [];
+  return [...joinedIds];
+}
+
 function coworkerListBlock(coworkers: Coworker[]): string {
   return coworkers
     .map(c => c.openId ? `- ${c.name} (open_id: ${c.openId})` : `- ${c.name}`)
@@ -81,6 +103,20 @@ export function buildCollabNote(coworkers: Coworker[], locale?: Locale): string 
   return `<botmux_collab>${t('cmd.createSession.collab_note', { peers: names }, locale)}</botmux_collab>`;
 }
 
+/** System-generated dashboard role context kept separate from the human task
+ * for Codex App clean-input materialization. Legacy CLIs still receive the
+ * concatenated string from composeSpawnUserContent(). */
+export function composeSpawnCodexAppContext(args: {
+  role: SpawnRole;
+  coworkers?: Coworker[];
+  locale?: Locale;
+}): string | undefined {
+  const coworkers = args.coworkers ?? [];
+  if (args.role === 'lead') return buildLeadDispatchPreamble(coworkers, args.locale);
+  if (args.role === 'collab') return buildCollabNote(coworkers, args.locale) || undefined;
+  return undefined;
+}
+
 /** 组装喂给 buildNewTopicPrompt 的「用户内容」——按角色在原始 content 前拼上
  *  lead 编排前言 / 协作提示。solo 原样返回。 */
 export function composeSpawnUserContent(args: {
@@ -89,16 +125,49 @@ export function composeSpawnUserContent(args: {
   coworkers?: Coworker[];
   locale?: Locale;
 }): string {
-  const { content, role, locale } = args;
-  const coworkers = args.coworkers ?? [];
-  if (role === 'lead') {
-    return `${buildLeadDispatchPreamble(coworkers, locale)}\n\n${content}`;
+  const context = composeSpawnCodexAppContext(args);
+  return context ? `${context}\n\n${args.content}` : args.content;
+}
+
+/** Merge a parked dashboard task with the first message that activates it.
+ * The legacy prompt combines queuedPrompt + current wrapped prompt elsewhere;
+ * this helper independently combines only raw user texts and metadata-only
+ * contexts so the visible Codex App turn neither drops nor duplicates the
+ * original dashboard task. */
+export function mergeQueuedCodexAppTurn(args: {
+  queued: boolean;
+  queuedText?: string;
+  queuedMessageContext?: string;
+  currentText: string;
+  currentMessageContext?: string;
+}): { text: string; messageContext?: string } {
+  if (!args.queued) {
+    return {
+      text: args.currentText,
+      ...(args.currentMessageContext ? { messageContext: args.currentMessageContext } : {}),
+    };
   }
-  if (role === 'collab') {
-    const note = buildCollabNote(coworkers, locale);
-    return note ? `${note}\n\n${content}` : content;
-  }
-  return content;
+  const text = [args.queuedText, args.currentText].filter(Boolean).join('\n\n') || args.currentText;
+  const messageContext = [args.queuedMessageContext, args.currentMessageContext].filter(Boolean).join('\n\n');
+  return { text, ...(messageContext ? { messageContext } : {}) };
+}
+
+/** Final compatibility gate for a queued dashboard task activated by a topic
+ * reply. Sessions parked before clean-input was introduced have queuedPrompt
+ * but no queuedCodexAppText. Their legacy content already contains both the
+ * queued task and the current reply, while the newly-built structured sidecar
+ * can only contain the current reply. Remove that incomplete sidecar so Codex
+ * App consumes the complete legacy prompt instead.
+ *
+ * A valid string field (including an explicitly stored empty string) identifies
+ * the new schema. Missing, null, or malformed persisted values fail closed to
+ * legacy content. Non-Codex payloads have no sidecar and remain unchanged. */
+export function applyQueuedCodexAppLegacyFallback(
+  payload: CliTurnPayload,
+  args: { queued: boolean; queuedText?: unknown },
+): CliTurnPayload {
+  if (!args.queued || typeof args.queuedText === 'string' || !payload.codexAppInput) return payload;
+  return { content: payload.content };
 }
 
 export interface SpawnRequest {
@@ -110,6 +179,7 @@ export interface SpawnRequest {
   ownerOpenId?: string;
   ownerUnionId?: string;
   title?: string;
+  images: DashboardImageUpload[];
 }
 
 export type ParseResult<T> = { ok: true; value: T } | { ok: false; error: string };
@@ -145,6 +215,8 @@ export function parseSpawnRequest(body: unknown): ParseResult<SpawnRequest> {
   const role = normalizeSpawnRole(b.role);
   if (!role) return { ok: false, error: 'bad_role' };
   const title = typeof b.title === 'string' && b.title.trim() ? b.title.trim().slice(0, 200) : undefined;
+  const parsedImages = parseDashboardImageUploads(b.images);
+  if (!parsedImages.ok) return { ok: false, error: parsedImages.error };
   return {
     ok: true,
     value: {
@@ -156,6 +228,7 @@ export function parseSpawnRequest(body: unknown): ParseResult<SpawnRequest> {
       ownerOpenId: typeof b.ownerOpenId === 'string' && b.ownerOpenId.trim() ? b.ownerOpenId.trim() : undefined,
       ownerUnionId: typeof b.ownerUnionId === 'string' && b.ownerUnionId.trim() ? b.ownerUnionId.trim() : undefined,
       title,
+      images: parsedImages.images,
     },
   };
 }

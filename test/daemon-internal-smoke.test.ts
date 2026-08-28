@@ -29,6 +29,7 @@ function makeStubDeps(): DaemonInternalApiDeps {
     resolveDashboardSettings: () => ({
       publicReadOnly: false,
       openTerminalInFeishu: false,
+      vcMeetingAgent: { enabled: true },
       maintenance: {},
       localDevInstall: false,
     }),
@@ -42,6 +43,7 @@ function makeStubDeps(): DaemonInternalApiDeps {
       resolveDashboardSettings: () => ({
         publicReadOnly: false,
         openTerminalInFeishu: false,
+        vcMeetingAgent: { enabled: true },
         maintenance: {},
         localDevInstall: false,
       }),
@@ -52,15 +54,6 @@ function makeStubDeps(): DaemonInternalApiDeps {
       proxyToDaemon: async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
       closeSessionsMatching: async () => [],
     },
-    workflowsActionDeps: {
-      runsDir: '/tmp/smoke-runs',
-      proxyToDaemon: async () => new Response('{}', { status: 200 }),
-      listRuns: async () => [],
-      readRunSnapshot: async () => null,
-      scrubSnapshotForUnauthed: (s: any) => s,
-      TERMINAL_RUN_STATUSES: new Set(['succeeded', 'failed', 'cancelled']),
-      isValidRunId: () => true,
-    } as any,
     proxyToDaemon: async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
     ownerOf: () => undefined,
     scheduleOwnerOf: () => undefined,

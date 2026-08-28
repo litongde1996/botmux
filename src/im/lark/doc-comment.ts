@@ -16,7 +16,7 @@
 import { getBotClient, getBot } from '../../bot-registry.js';
 import { resolveUserToken } from '../../utils/user-token.js';
 import { logger } from '../../utils/logger.js';
-import { UserTokenMissingError } from './client.js';
+import { UserTokenMissingError, assertLarkTransport } from './client.js';
 import { type Brand, larkHosts, normalizeBrand } from './lark-hosts.js';
 import type { CommentTriggerMode } from '../../services/doc-subs-store.js';
 
@@ -87,6 +87,10 @@ export interface DocComment {
   commentId: string;
   /** 评论是否已解决。 */
   isSolved: boolean;
+  /** 局部评论选中的文档原文；全文评论通常为空。 */
+  quote?: string;
+  /** 是否为整篇文档的全文评论。 */
+  isWhole?: boolean;
   /** 该评论 thread 下所有回复（飞书把评论建模成 reply_list）。 */
   replies: Array<{
     replyId: string;
@@ -175,6 +179,100 @@ interface DriveCallOpts {
   /** true 时**优先 tenant（应用身份）**，失败再回退 user。用于发评论——这样 bot 的
    *  回复显示为机器人本身，而非授权用户。bot 对该文档无访问权时回退 user 身份保证落地。 */
   preferTenant?: boolean;
+  /** 订阅 API 专用：把 1069603 连同实际失败身份归一化为结构化异常。 */
+  classifySubscriptionPermission?: boolean;
+  /** Managed-origin fence invoked immediately before every actual tenant/user
+   * provider request. It deliberately sits outside fallback catch blocks so a
+   * revoked origin aborts instead of being mistaken for an identity failure. */
+  beforeProviderEffect?: () => void | Promise<void>;
+}
+
+export interface DocProviderEffectOptions {
+  beforeProviderEffect?: () => void | Promise<void>;
+}
+
+const DOC_SUBSCRIPTION_PERMISSION_CODE = 1069603;
+
+/**
+ * User Token 有效但没有目标文档权限。它必须与 UserTokenMissingError 分开：
+ * 403 重新 OAuth 不会增加文档角色，但仍可回退 tenant（应用可能已被加为文档应用）。
+ */
+class UserTokenForbiddenError extends Error {
+  readonly httpStatus = 403;
+
+  constructor(
+    readonly larkCode?: number,
+    readonly larkMessage?: string,
+  ) {
+    super(`User Token 无权访问该文档（HTTP 403${larkCode !== undefined ? `, code: ${larkCode}` : ''}）。`);
+    this.name = 'UserTokenForbiddenError';
+  }
+}
+
+export type DocSubscriptionPermissionSource = 'user' | 'tenant' | 'both' | 'unknown';
+
+export interface DocSubscriptionPermissionDetails {
+  source: DocSubscriptionPermissionSource;
+  userLarkMessage?: string;
+  tenantLarkMessage?: string;
+  tenantHttpStatus?: number;
+}
+
+/**
+ * 飞书订阅接口返回 1069603。保留实际返回该业务码的身份，避免 tenant-only
+ * 失败被错误归因成“当前用户无权限”；只保留业务字段，不把可能含 token/header
+ * 的 AxiosError 挂进 cause。
+ */
+export class DocSubscriptionPermissionError extends Error {
+  readonly larkCode = DOC_SUBSCRIPTION_PERMISSION_CODE;
+
+  constructor(readonly details: DocSubscriptionPermissionDetails) {
+    super(`订阅文档被飞书拒绝（code: ${DOC_SUBSCRIPTION_PERMISSION_CODE}, source: ${details.source}）。`);
+    this.name = 'DocSubscriptionPermissionError';
+  }
+
+  get source(): DocSubscriptionPermissionSource {
+    return this.details.source;
+  }
+}
+
+function getLarkErrorCode(err: unknown): number | undefined {
+  if (err instanceof UserTokenForbiddenError) return err.larkCode;
+  const code = (err as any)?.response?.data?.code ?? (err as any)?.code;
+  return typeof code === 'number' ? code : undefined;
+}
+
+function getLarkErrorMessage(err: unknown): string | undefined {
+  if (err instanceof UserTokenForbiddenError) return err.larkMessage;
+  const msg = (err as any)?.response?.data?.msg ?? (err as any)?.msg;
+  return typeof msg === 'string' ? msg : undefined;
+}
+
+function subscriptionPermissionSource(
+  userForbidden: UserTokenForbiddenError | undefined,
+  tenantHasPermissionCode: boolean,
+): DocSubscriptionPermissionSource {
+  const userHasPermissionCode = userForbidden?.larkCode === DOC_SUBSCRIPTION_PERMISSION_CODE;
+  if (userHasPermissionCode && tenantHasPermissionCode) return 'both';
+  if (tenantHasPermissionCode) return 'tenant';
+  if (userHasPermissionCode) return 'user';
+  return 'unknown';
+}
+
+function subscriptionPermissionError(
+  userForbidden: UserTokenForbiddenError | undefined,
+  tenantErrorOrResponse?: unknown,
+  tenantHttpStatus?: number,
+): DocSubscriptionPermissionError {
+  const tenantHasPermissionCode = getLarkErrorCode(tenantErrorOrResponse) === DOC_SUBSCRIPTION_PERMISSION_CODE;
+  return new DocSubscriptionPermissionError({
+    source: subscriptionPermissionSource(userForbidden, tenantHasPermissionCode),
+    ...(userForbidden?.larkMessage ? { userLarkMessage: userForbidden.larkMessage } : {}),
+    ...(tenantHasPermissionCode && getLarkErrorMessage(tenantErrorOrResponse)
+      ? { tenantLarkMessage: getLarkErrorMessage(tenantErrorOrResponse) }
+      : {}),
+    ...(tenantHttpStatus !== undefined ? { tenantHttpStatus } : {}),
+  });
 }
 
 function buildQuery(params?: DriveCallOpts['params']): string {
@@ -193,6 +291,11 @@ function buildQuery(params?: DriveCallOpts['params']): string {
  * 空 body 守卫）。返回飞书统一响应体 `{ code, msg, data }`。
  */
 async function driveApiCall(larkAppId: string, opts: DriveCallOpts): Promise<any> {
+  // Bot-level transport boundary: doc-comment has its OWN direct-Feishu drive
+  // API (subscribe/reply/comment/reaction) that bypasses im/lark/client.ts, so
+  // enforce the same apiOnly gate here. A core-only bot has no Feishu tenant
+  // token and no doc surface, so every drive call — read or write — is refused.
+  assertLarkTransport(larkAppId, `driveApiCall ${opts.method} ${opts.path}`);
   const bot = getBot(larkAppId);
   const brand = normalizeBrand(bot.config.brand);
 
@@ -207,8 +310,13 @@ async function driveApiCall(larkAppId: string, opts: DriveCallOpts): Promise<any
     });
   };
   const callUser = async () => {
+    // Token resolution may refresh an expired user token over the network.
+    // Fence both that refresh and the actual Drive request: revocation in
+    // either interval must stop before the next provider-visible effect.
+    await opts.beforeProviderEffect?.();
     const userToken = await resolveUserToken(bot.config.larkAppId, bot.config.larkAppSecret, brand);
     if (!userToken) throw new UserTokenMissingError('该操作需要 User Token（请在话题中 /login 授权）。');
+    await opts.beforeProviderEffect?.();
     return fetchWithUserToken(brand, userToken, opts);
   };
 
@@ -216,6 +324,7 @@ async function driveApiCall(larkAppId: string, opts: DriveCallOpts): Promise<any
 
   // 发评论：优先应用身份（回复显示为 bot），bot 无访问权（抛错或 code!=0）时回退用户身份。
   if (opts.preferTenant) {
+    await opts.beforeProviderEffect?.();
     try {
       const res = await callTenant();
       if (res?.code === 0) return res;
@@ -227,16 +336,70 @@ async function driveApiCall(larkAppId: string, opts: DriveCallOpts): Promise<any
   }
 
   // 默认：优先 user（有 token），401/403 回退 tenant。
+  let userForbidden: UserTokenForbiddenError | undefined;
+  await opts.beforeProviderEffect?.();
   const userToken = await resolveUserToken(bot.config.larkAppId, bot.config.larkAppSecret, brand);
   if (userToken) {
     try {
-      return await fetchWithUserToken(brand, userToken, opts);
+      await opts.beforeProviderEffect?.();
+      const userResult = await fetchWithUserToken(brand, userToken, opts);
+      if (
+        opts.classifySubscriptionPermission
+        && userResult?.code === DOC_SUBSCRIPTION_PERMISSION_CODE
+      ) {
+        userForbidden = new UserTokenForbiddenError(
+          DOC_SUBSCRIPTION_PERMISSION_CODE,
+          typeof userResult?.msg === 'string' ? userResult.msg : undefined,
+        );
+      } else {
+        return userResult;
+      }
     } catch (err) {
-      if (!(err instanceof UserTokenMissingError)) throw err;
+      if (err instanceof UserTokenForbiddenError) {
+        userForbidden = err;
+      } else if (!(err instanceof UserTokenMissingError)) {
+        throw err;
+      }
       logger.debug(`[doc-comment] user token rejected (${opts.path}); falling back to tenant`);
     }
   }
-  return callTenant();
+
+  let tenantResult: any;
+  await opts.beforeProviderEffect?.();
+  try {
+    tenantResult = await callTenant();
+  } catch (tenantError) {
+    const tenantStatus = (tenantError as any)?.response?.status ?? (tenantError as any)?.status;
+    if (
+      opts.classifySubscriptionPermission
+      && getLarkErrorCode(tenantError) === DOC_SUBSCRIPTION_PERMISSION_CODE
+    ) {
+      throw subscriptionPermissionError(userForbidden, tenantError, tenantStatus);
+    }
+    // 订阅 API 的 owner/manager 错误来自首选 user 身份时，不能让 tenant 的
+    // generic Axios 403（无飞书业务码）覆盖掉飞书业务码，否则上层只能看到
+    // “status code 403”。tenant 明确返回其他 HTTP 状态或业务码时必须保留，
+    // 避免把凭证、限流或服务故障误报成文档 owner/manager 权限不足。
+    if (
+      userForbidden?.larkCode === DOC_SUBSCRIPTION_PERMISSION_CODE
+      && tenantStatus === 403
+      && getLarkErrorCode(tenantError) === undefined
+    ) {
+      logger.debug(`[doc-comment] tenant fallback also failed (${opts.path}); preserving user code=${userForbidden.larkCode}`);
+      if (opts.classifySubscriptionPermission) {
+        throw subscriptionPermissionError(userForbidden, undefined, tenantStatus);
+      }
+      throw userForbidden;
+    }
+    throw tenantError;
+  }
+  if (
+    opts.classifySubscriptionPermission
+    && tenantResult?.code === DOC_SUBSCRIPTION_PERMISSION_CODE
+  ) {
+    throw subscriptionPermissionError(userForbidden, tenantResult);
+  }
+  return tenantResult;
 }
 
 async function fetchWithUserToken(brand: Brand, userToken: string, opts: DriveCallOpts): Promise<any> {
@@ -249,14 +412,17 @@ async function fetchWithUserToken(brand: Brand, userToken: string, opts: DriveCa
     },
     ...(opts.data !== undefined ? { body: JSON.stringify(opts.data) } : {}),
   });
+  const body = await res.json().catch(() => ({})) as any;
   if (res.status === 401) {
     throw new UserTokenMissingError('User Token 已失效（HTTP 401）。请在话题中 /login 重新授权。');
   }
   if (res.status === 403) {
     // token 有效但无权访问该文档 —— 视作可回退（也许 tenant 有权）
-    throw new UserTokenMissingError(`User Token 无权访问该文档（HTTP 403）。`);
+    throw new UserTokenForbiddenError(
+      typeof body?.code === 'number' ? body.code : undefined,
+      typeof body?.msg === 'string' ? body.msg : undefined,
+    );
   }
-  const body = await res.json().catch(() => ({})) as any;
   if (!res.ok) {
     throw new Error(`drive API ${opts.path} HTTP ${res.status}: ${body?.msg ?? ''}`);
   }
@@ -278,7 +444,14 @@ export async function subscribeDocFile(larkAppId: string, file: ResolvedDocFile)
     method: 'POST',
     path: `/open-apis/drive/v1/files/${encodeURIComponent(file.fileToken)}/subscribe`,
     params: { file_type: file.fileType },
+    classifySubscriptionPermission: true,
   });
+  if (res?.code === DOC_SUBSCRIPTION_PERMISSION_CODE) {
+    throw new DocSubscriptionPermissionError({
+      source: 'unknown',
+      ...(typeof res?.msg === 'string' ? { tenantLarkMessage: res.msg } : {}),
+    });
+  }
   ensureOk(res, '订阅文档');
   logger.info(`[doc-comment] subscribed file=${file.fileToken.slice(0, 12)} type=${file.fileType}`);
 }
@@ -344,17 +517,54 @@ export async function getDocComment(
 
 function normalizeComment(raw: any): DocComment {
   const replies = Array.isArray(raw?.reply_list?.replies) ? raw.reply_list.replies : [];
+  const quote = typeof raw?.quote === 'string'
+    ? raw.quote.trim()
+    : elementsToText(raw?.quote?.content?.elements ?? raw?.quote?.elements).trim();
   return {
     commentId: raw?.comment_id ?? '',
     isSolved: raw?.is_solved === true,
+    quote: quote || undefined,
+    isWhole: raw?.is_whole === true,
     replies: replies.map((r: any) => ({
       replyId: r?.reply_id ?? '',
       userId: r?.user_id,
       text: elementsToText(r?.content?.elements),
       mentions: elementsMentions(r?.content?.elements),
-      createdAt: typeof r?.create_time === 'number' ? r.create_time : undefined,
+      createdAt: Number.isFinite(Number(r?.create_time)) ? Number(r.create_time) : undefined,
     })),
   };
+}
+
+/**
+ * 列出文档当前可见的全部评论。`/watch-comment --all` 用它做增量轮询：
+ * 评论读取优先应用身份，因此不需要 User Token；只有应用身份无权访问文档时才
+ * 回退已有的用户授权。
+ */
+export async function listDocComments(
+  larkAppId: string,
+  file: ResolvedDocFile,
+): Promise<DocComment[]> {
+  const comments: DocComment[] = [];
+  let pageToken: string | undefined;
+  do {
+    const res = await driveApiCall(larkAppId, {
+      method: 'GET',
+      path: `/open-apis/drive/v1/files/${encodeURIComponent(file.fileToken)}/comments`,
+      params: {
+        file_type: file.fileType,
+        user_id_type: 'open_id',
+        page_size: 50,
+        page_token: pageToken,
+      },
+      preferTenant: true,
+    });
+    const data = ensureOk(res, '列出评论');
+    if (Array.isArray(data?.items)) comments.push(...data.items.map(normalizeComment));
+    pageToken = data?.has_more === true && typeof data?.page_token === 'string' && data.page_token
+      ? data.page_token
+      : undefined;
+  } while (pageToken);
+  return comments;
 }
 
 // ─── 回评论 ─────────────────────────────────────────────────────────────────────
@@ -373,6 +583,7 @@ export async function replyToDocComment(
   commentId: string,
   text: string,
   mentionOpenId?: string,
+  options: DocProviderEffectOptions = {},
 ): Promise<{ replyId?: string; commentId?: string }> {
   const elements = buildCommentElements(text, mentionOpenId);
   let res: any;
@@ -383,13 +594,14 @@ export async function replyToDocComment(
       params: { file_type: file.fileType, user_id_type: 'open_id' },
       data: { content: { elements } },
       preferTenant: true, // 回复显示为 bot 本身（应用身份）；bot 无访问权时回退 user
+      beforeProviderEffect: options.beforeProviderEffect,
     });
   } catch (err) {
     // 有的评论不允许被回复（飞书 1069302：全文评论 / 已解决 / 文档评论设置受限）。
     // 退回新建一条全文评论，保证 bot 的答复总能落到文档（不嵌套但仍在评论区）。
     if (isReplyNotAllowed(err)) {
       logger.warn(`[doc-comment] comment=${commentId.slice(0, 12)} 不允许回复，退回新建全文评论`);
-      const c = await createDocComment(larkAppId, file, text, mentionOpenId);
+      const c = await createDocComment(larkAppId, file, text, mentionOpenId, options);
       return { replyId: c.replyId, commentId: c.commentId };
     }
     throw err;
@@ -398,7 +610,7 @@ export async function replyToDocComment(
   if (res?.code !== 0) {
     if (isReplyNotAllowed(res)) {
       logger.warn(`[doc-comment] comment=${commentId.slice(0, 12)} 不允许回复(code=${res?.code})，退回新建全文评论`);
-      const c = await createDocComment(larkAppId, file, text, mentionOpenId);
+      const c = await createDocComment(larkAppId, file, text, mentionOpenId, options);
       return { replyId: c.replyId, commentId: c.commentId };
     }
     throw new Error(`回复评论 失败: ${res?.msg ?? 'unknown'} (code: ${res?.code})`);
@@ -436,6 +648,7 @@ export async function createDocComment(
   file: ResolvedDocFile,
   text: string,
   mentionOpenId?: string,
+  options: DocProviderEffectOptions = {},
 ): Promise<{ commentId: string; replyId?: string }> {
   const elements = buildCommentElements(text, mentionOpenId);
   const res = await driveApiCall(larkAppId, {
@@ -444,6 +657,7 @@ export async function createDocComment(
     params: { file_type: file.fileType, user_id_type: 'open_id' },
     data: { reply_list: { replies: [{ content: { elements } }] } },
     preferTenant: true, // 评论显示为 bot 本身（应用身份）；bot 无访问权时回退 user
+    beforeProviderEffect: options.beforeProviderEffect,
   });
   const data = ensureOk(res, '发表评论');
   const commentId: string = data?.comment_id ?? '';
@@ -469,4 +683,79 @@ export function chunkCommentText(text: string, max = DOC_COMMENT_MAX_CHARS): str
   }
   if (rest) chunks.push(rest);
   return chunks;
+}
+
+// ─── Reaction（"Typing" 指示器）────────────────────────────────────────────
+
+/**
+ * 给评论回复加 reaction（"Typing" 处理中指示器）。
+ *
+ * 用户在文档评论里 @bot 后，bot 立即给那条回复加一个 "Typing" emoji，让用户
+ * 知道 bot 收到了、正在处理。bot 回复发出后再删掉。
+ *
+ * 端点：`POST drive/v2/files/{token}/comments/reaction`（v2，评论 reaction 专用）。
+ * 优先应用身份（reaction 显示为 bot 加的）。
+ *
+ * @returns 新创建的 reaction_id（删除时要用）；失败返回 undefined（不阻塞主流程）。
+ */
+export async function addCommentReaction(
+  larkAppId: string,
+  file: ResolvedDocFile,
+  commentId: string,
+  replyId: string,
+  reactionType: string,
+  options: DocProviderEffectOptions = {},
+): Promise<string | undefined> {
+  try {
+    const res = await driveApiCall(larkAppId, {
+      method: 'POST',
+      path: `/open-apis/drive/v2/files/${encodeURIComponent(file.fileToken)}/comments/reaction`,
+      params: { file_type: file.fileType },
+      data: { action: 'add', comment_id: commentId, reply_id: replyId, reaction_type: reactionType },
+      preferTenant: true,
+      beforeProviderEffect: options.beforeProviderEffect,
+    });
+    const reactionId: string | undefined = res?.data?.reaction_id;
+    if (reactionId) {
+      logger.info(`[doc-comment] added reaction=${reactionId} type=${reactionType} on reply=${replyId.slice(0, 12)}`);
+    }
+    return reactionId;
+  } catch (err) {
+    logger.warn(`[doc-comment] addCommentReaction failed for reply=${replyId.slice(0, 12)}: ${err instanceof Error ? err.message : err}`);
+    return undefined;
+  }
+}
+
+/**
+ * 删除评论回复的 reaction（bot 回复发出后清理 "Typing" 指示器）。
+ *
+ * 端点：`DELETE drive/v2/files/{token}/comments/reaction`，参数全走 query string。
+ * best-effort：失败只告警不抛（bot 已经成功回复了，reaction 留着也不影响）。
+ */
+export async function removeCommentReaction(
+  larkAppId: string,
+  file: ResolvedDocFile,
+  commentId: string,
+  replyId: string,
+  reactionId: string,
+  options: DocProviderEffectOptions = {},
+): Promise<void> {
+  if (!reactionId) return;
+  try {
+    await driveApiCall(larkAppId, {
+      method: 'DELETE',
+      path: `/open-apis/drive/v2/files/${encodeURIComponent(file.fileToken)}/comments/reaction`,
+      params: {
+        file_type: file.fileType,
+        comment_id: commentId,
+        reply_id: replyId,
+        reaction_id: reactionId,
+      },
+      preferTenant: true,
+      beforeProviderEffect: options.beforeProviderEffect,
+    });
+    logger.info(`[doc-comment] removed reaction=${reactionId.slice(0, 12)} on reply=${replyId.slice(0, 12)}`);
+  } catch (err) {
+    logger.warn(`[doc-comment] removeCommentReaction failed for reaction=${reactionId.slice(0, 12)}: ${err instanceof Error ? err.message : err}`);
+  }
 }

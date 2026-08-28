@@ -20,7 +20,22 @@
  * early and degrades to the old lose-on-crash behavior for that turn only.
  */
 
-export type InflightItem = { content: string; turnId?: string };
+import type { CodexAppTurnInput, VcMeetingImTurnOrigin } from '../types.js';
+
+export type InflightItem = {
+  content: string;
+  logicalContent?: string;
+  turnId?: string;
+  replyTurnId?: string;
+  dispatchAttempt?: number;
+  codexAppDispatchId?: string;
+  queuedActivationToken?: string;
+  vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
+  codexAppInput?: CodexAppTurnInput;
+  /** At-most-once turn (idempotency lease): must NEVER be carried over to a
+   *  respawned CLI (codex #776 round-7 finding #1). See PendingCliInput.noReplay. */
+  noReplay?: boolean;
+};
 
 export class InflightInputTracker {
   private unacked: InflightItem[] = [];
@@ -29,6 +44,23 @@ export class InflightInputTracker {
   /** An input just went onto the CLI's PTY. */
   onWrite(item: InflightItem): void {
     this.unacked.push(item);
+  }
+
+  /** Remove one exact item after a definitive local write failure before the
+   * caller re-queues it. Covers both the live in-flight set and a synchronous
+   * backend-exit handoff that may already have moved it to carryOver. */
+  forget(item: InflightItem): void {
+    this.unacked = this.unacked.filter(candidate => candidate !== item);
+    this.carryOver = this.carryOver.filter(candidate => candidate !== item);
+  }
+
+  /** Retire one exact write whose transport outcome is ambiguous and must not
+   * be replayed automatically. Other type-ahead items remain tracked. */
+  retire(item: InflightItem): boolean {
+    const index = this.unacked.indexOf(item);
+    if (index < 0) return false;
+    this.unacked.splice(index, 1);
+    return true;
   }
 
   /** CLI is back at its idle prompt — everything written has been consumed
@@ -42,10 +74,11 @@ export class InflightInputTracker {
    *  Appends (rather than replaces) so a double exit before the respawn
    *  consumes the stash can't drop the earlier batch. Returns how many
    *  items were newly stashed by THIS exit. */
-  onCliExit(): number {
-    const n = this.unacked.length;
-    if (n > 0) this.carryOver.push(...this.unacked.splice(0));
-    return n;
+  onCliExit(shouldCarry: (item: InflightItem) => boolean = () => true): number {
+    const exiting = this.unacked.splice(0);
+    const carried = exiting.filter(shouldCarry);
+    if (carried.length > 0) this.carryOver.push(...carried);
+    return carried.length;
   }
 
   /** A fresh CLI is spawning: hand back everything that must be re-queued,

@@ -9,13 +9,27 @@
  *
  * Run:  pnpm vitest run test/prompt-builder.test.ts
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 
 // ─── Mocks ────────────────────────────────────────────────────────────────
 
 vi.mock('node:child_process', () => ({
+  execFile: vi.fn((_file: string, _args: string[], cb?: (...args: any[]) => void) => {
+    if (typeof cb === 'function') cb(null, '', '');
+    return {} as any;
+  }),
   execSync: vi.fn(() => ''),
   execFileSync: vi.fn(() => ''),
+}));
+
+vi.mock('node-pty', () => ({
+  spawn: vi.fn(() => ({
+    onData: vi.fn(),
+    onExit: vi.fn(),
+    write: vi.fn(),
+    resize: vi.fn(),
+    kill: vi.fn(),
+  })),
 }));
 
 vi.mock('node:fs', async () => {
@@ -36,14 +50,22 @@ vi.mock('../src/im/lark/client.js', () => ({
   listChatBotMembers: vi.fn(async () => []),
 }));
 
+// Mutable per-test bot config so the senderTag gate can be exercised in both
+// states. Default shape matches the previous static mock byte-for-byte, so every
+// pre-existing test keeps its original behavior.
+const mockBotConfig: Record<string, unknown> = {
+  larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code',
+};
+
 vi.mock('../src/bot-registry.js', () => ({
-  getBot: vi.fn(() => ({
-    config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
-  })),
+  getBot: vi.fn(() => ({ config: mockBotConfig })),
   getAllBots: vi.fn(() => []),
 }));
 
 vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
   createSession: vi.fn(),
   updateSession: vi.fn(),
 }));
@@ -64,12 +86,16 @@ vi.mock('../src/services/whiteboard-store.js', () => ({
 vi.mock('../src/core/worker-pool.js', () => ({
   forkWorker: vi.fn(),
   killStalePids: vi.fn(),
+  sweepDeadPidMarkers: vi.fn(),
+  getActiveSessionsRegistry: vi.fn(() => undefined),
   getCurrentCliVersion: vi.fn(() => '1.0.0'),
 }));
 
 // ─── Imports ──────────────────────────────────────────────────────────────
 
 import { buildNewTopicPrompt, buildFollowUpContent, buildReforkPrompt, renderSenderTag, renderCursorSenderNote, renderBufferedSenderBlock } from '../src/core/session-manager.js';
+import { config } from '../src/config.js';
+import { BOTMUX_SHELL_HINTS, buildBotmuxShellHints, buildBotmuxSystemPromptText } from '../src/adapters/cli/shared-hints.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 // ─── Tests ────────────────────────────────────────────────────────────────
@@ -90,10 +116,39 @@ describe('buildNewTopicPrompt', () => {
   it('should include heredoc guidance for non-Claude CLIs', () => {
     const prompt = buildNewTopicPrompt('hello', SESSION_ID, 'codex');
     expect(prompt).toContain("botmux send <<'EOF'");
+    expect(prompt).not.toContain("botmux send &lt;&lt;'EOF'");
     expect(prompt).toContain('第一行');
     expect(prompt).toContain('第二行');
     expect(prompt).toContain('botmux send "第一行\\n第二行"');
     expect(prompt).toContain('字面量');
+    expect(prompt).toContain('JSON.stringify');
+    expect(prompt).toContain('--content-file');
+  });
+
+  it('tells non-injecting CLIs to silently obey hidden launch context and answer only user_message', () => {
+    const prompt = buildNewTopicPrompt('hello', SESSION_ID, 'codex');
+    const routing = prompt.slice(prompt.indexOf('<botmux_routing>'), prompt.indexOf('</botmux_routing>'));
+
+    expect(routing).toContain('隐藏运行上下文');
+    expect(routing).toContain('&lt;botmux_builtin_skills&gt;');
+    expect(routing).toContain('&lt;identity&gt;');
+    expect(routing).toContain('&lt;available_bots&gt;');
+    expect(routing).toContain('不要回复、不要确认');
+    expect(routing).toContain('已了解/已补充/已记录');
+    expect(routing).toContain('只处理 `&lt;user_message&gt;` 中的真实用户请求');
+    expect(routing).not.toContain('&amp;lt;');
+  });
+
+  it('gives Hermes the standard botmux-send routing hints like other structured-bridge CLIs', () => {
+    // #365 previously steered Hermes AWAY from `botmux send` (reverse guidance)
+    // as a redundant belt-and-braces on top of the real dedup fix
+    // (preserveMarkTimeMs). That reverse hint weakened multi-agent collaboration
+    // (bridge-forwarded finals can't carry an @mention), so Hermes now uses the
+    // same send-first hints as codex/traex/grok.
+    const prompt = buildNewTopicPrompt('hello', SESSION_ID, 'hermes');
+    expect(prompt).toContain('把消息发给用户（唯一方式）');
+    expect(prompt).not.toContain('普通文本答案不要调用 `botmux send`');
+    expect(prompt).not.toContain('botmux 会自动把 final_output 转发到飞书');
   });
 
   it('should NOT embed <session_id> for CLIs with injectsSessionContext (claude-code)', () => {
@@ -143,6 +198,14 @@ describe('buildNewTopicPrompt', () => {
 
     expect(prompt).toContain('<whiteboard id="wb_test">');
     expect(prompt).toContain('读取：`botmux whiteboard read --id wb_test --json`');
+    expect(prompt).toContain('&lt;上次 read 的 updatedAt&gt;');
+    expect(prompt).toContain('&lt;内容&gt;');
+    const whiteboard = prompt.slice(
+      prompt.indexOf('<whiteboard '),
+      prompt.indexOf('</whiteboard>') + '</whiteboard>'.length,
+    );
+    const whiteboardProse = whiteboard.replace(/<\/?whiteboard(?:\s[^>]*)?>/g, '');
+    expect(whiteboardProse.match(/<[^<>\r\n]+>/g) ?? []).toEqual([]);
     // The CAS flow: update carries --expected-updated-at, and a mismatch tells
     // the agent to re-read. Pin both so the prompt keeps guiding agents to CAS.
     expect(prompt).toContain('update --id wb_test --expected-updated-at');
@@ -189,6 +252,29 @@ describe('buildNewTopicPrompt', () => {
     expect(prompt.indexOf(`<session_id>${SESSION_ID}</session_id>`)).toBeLessThan(prompt.indexOf('<user_message>'));
   });
 
+  it.each([
+    ['zh', '&lt;对方 open_id&gt;'],
+    ['en', '&lt;their open_id&gt;'],
+  ] as const)('escapes tag-like placeholders in the %s inline identity prose', (locale, expectedPlaceholder) => {
+    const prompt = buildNewTopicPrompt(
+      'hello',
+      SESSION_ID,
+      'codex',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { name: 'Codex Bot', openId: 'ou_bot' },
+      locale,
+    );
+    const identity = prompt.slice(prompt.indexOf('<identity>'), prompt.indexOf('</identity>') + '</identity>'.length);
+    const prose = identity.replace(/<\/?(?:identity|name|open_id|routing_rules)>/g, '');
+
+    expect(identity).toContain(expectedPlaceholder);
+    expect(prose.match(/<[^<>\r\n]+>/g) ?? []).toEqual([]);
+  });
+
   it('keeps per-turn sender and mentions after the first user message', () => {
     const prompt = buildNewTopicPrompt(
       'hello',
@@ -206,6 +292,52 @@ describe('buildNewTopicPrompt', () => {
 
     expect(prompt.indexOf('<sender ')).toBeGreaterThan(prompt.indexOf('<user_message>'));
     expect(prompt.indexOf('<mentions>')).toBeGreaterThan(prompt.indexOf('<user_message>'));
+  });
+});
+
+describe('botmux routing prose XML boundaries', () => {
+  it.each([
+    ['zh', '&lt;open_id:名字&gt;'],
+    ['en', '&lt;open_id:name&gt;'],
+  ] as const)('escapes tag-like placeholders in %s inline shell hints while preserving heredoc syntax', (locale, mentionPlaceholder) => {
+    const hints = buildBotmuxShellHints(locale).join('\n');
+
+    expect(hints).toContain('&lt;message_id&gt;');
+    expect(hints).toContain(mentionPlaceholder);
+    expect(hints).toContain('&lt;whiteboard&gt;');
+    expect(hints).toContain("botmux send <<'EOF'");
+    expect(hints).not.toContain("botmux send &lt;&lt;'EOF'");
+    expect(hints.match(/<[^<>\r\n]+>/g) ?? []).toEqual([]);
+  });
+
+  it('keeps the legacy static shell hints on the same selective-escaping boundary', () => {
+    const hints = BOTMUX_SHELL_HINTS.join('\n');
+
+    expect(hints).toContain('&lt;message_id&gt;');
+    expect(hints).toContain("botmux send <<'EOF'");
+    expect(hints).not.toContain("botmux send &lt;&lt;'EOF'");
+    expect(hints.match(/<[^<>\r\n]+>/g) ?? []).toEqual([]);
+  });
+
+  it.each([
+    ['zh', '&lt;对方 open_id&gt;'],
+    ['en', '&lt;their open_id&gt;'],
+  ] as const)('escapes tag-like placeholders in the %s system-prompt prose while preserving real structure and heredoc syntax', (locale, mentionPlaceholder) => {
+    const prompt = buildBotmuxSystemPromptText({
+      locale,
+      botName: 'Codex Bot',
+      botOpenId: 'ou_bot',
+    });
+    const prose = prompt.replace(/<\/?(?:botmux_routing|identity|name|open_id|routing_rules)>/g, '');
+
+    expect(prompt).toContain('<botmux_routing>');
+    expect(prompt).toContain('<identity>');
+    expect(prompt).toContain(mentionPlaceholder);
+    expect(prompt).toContain('&lt;available_bots&gt;');
+    expect(prompt).toContain('&lt;whiteboard&gt;');
+    expect(prompt).toContain("botmux send <<'EOF'");
+    expect(prompt).not.toContain("botmux send &lt;&lt;'EOF'");
+    expect(prose.match(/<[^<>\r\n]+>/g) ?? []).toEqual([]);
   });
 });
 
@@ -251,6 +383,25 @@ describe('buildFollowUpContent', () => {
     expect(content).toContain('open_id="ou_bob"');
   });
 
+  it('includes substitute trigger metadata in follow-up prompts', () => {
+    const content = buildFollowUpContent('hello', SESSION_ID, {
+      sender: { openId: 'ou_sender', type: 'user', name: 'Sender' },
+      mentions: [{ name: 'Alice', openId: 'ou_alice', userId: 'u_alice' }],
+      substituteTrigger: {
+        target: { name: 'Alice', openId: 'ou_alice', userId: 'u_alice' },
+        disclosure: 'prefix',
+      },
+    });
+
+    expect(content).toContain('<substitute_trigger>');
+    expect(content).toContain('name="Alice"');
+    expect(content).toContain('open_id="ou_alice"');
+    expect(content).toContain('user_id="u_alice"');
+    expect(content).toContain('<disclosure>prefix</disclosure>');
+    expect(content.indexOf('<sender ')).toBeLessThan(content.indexOf('<substitute_trigger>'));
+    expect(content.indexOf('<substitute_trigger>')).toBeLessThan(content.indexOf('<mentions>'));
+  });
+
   it('places stable reminder before follow-up user content', () => {
     const content = buildFollowUpContent('hello', SESSION_ID, {
       cliId: 'codex',
@@ -262,6 +413,54 @@ describe('buildFollowUpContent', () => {
     expect(content.indexOf('<botmux_reminder>')).toBeLessThan(content.indexOf('<user_message>'));
     expect(content.indexOf('<sender ')).toBeGreaterThan(content.indexOf('</user_message>'));
     expect(content.indexOf('<mentions>')).toBeGreaterThan(content.indexOf('</user_message>'));
+    // Complex send guidance is discoverable once in the opening catalog; keep
+    // every follow-up reminder intentionally tiny. By default (experimental
+    // anti-resend toggle OFF) it is exactly #554's nothing-to-send sentinel
+    // baseline — no anti-resend clause appended.
+    expect(content).toContain('<botmux_reminder>发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND</botmux_reminder>');
+    expect(content).not.toContain('别因「无输出」提示重发');
+    expect(content).not.toContain('JSON.stringify');
+    expect(content).not.toContain('botmux skill show botmux-send');
+  });
+
+  it('carries the anti-resend reminder variant when config.noVisibleOutputHint is ON', () => {
+    (config as { noVisibleOutputHint?: boolean }).noVisibleOutputHint = true;
+    try {
+      const content = buildFollowUpContent('hello', SESSION_ID, { cliId: 'codex' });
+      // ON variant must inherit #554's sentinel semantics AND add anti-resend.
+      expect(content).toContain('final 只输出 BOTMUX_NOTHING_TO_SEND');
+      expect(content).toMatch(/<botmux_reminder>[^<]*别因「无输出」提示重发[^<]*<\/botmux_reminder>/);
+    } finally {
+      delete (config as { noVisibleOutputHint?: boolean }).noVisibleOutputHint;
+    }
+  });
+
+  it('gives Hermes the standard follow-up reminder like other CLIs (no reverse send guidance)', () => {
+    // #365 previously steered Hermes AWAY from `botmux send` (reverse guidance)
+    // as redundant belt-and-braces on top of the real dedup fix
+    // (preserveMarkTimeMs). That reverse hint weakened multi-agent collaboration
+    // (bridge-forwarded finals can't carry an @mention), so Hermes now shares
+    // the standard path. With the anti-resend toggle OFF (default) that is
+    // exactly #554's nothing-to-send sentinel baseline — same as codex/traex.
+    const content = buildFollowUpContent('hello', SESSION_ID, { cliId: 'hermes' });
+
+    expect(content).toContain('<botmux_reminder>发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND</botmux_reminder>');
+    expect(content).not.toContain('普通文字回复不要调用 `botmux send`');
+    expect(content).not.toContain('直接把给用户看的答案写在 final');
+  });
+
+  it('routes Hermes through the shared anti-resend branch when noVisibleOutputHint is ON', () => {
+    // Codex-review guard for #653: prove Hermes really lands in the shared
+    // noVisibleOutputHint branch (not a special-cased bypass), so the toggle
+    // reaches it just like every other non-Mira CLI.
+    (config as { noVisibleOutputHint?: boolean }).noVisibleOutputHint = true;
+    try {
+      const content = buildFollowUpContent('hello', SESSION_ID, { cliId: 'hermes' });
+      expect(content).toContain('final 只输出 BOTMUX_NOTHING_TO_SEND');
+      expect(content).toMatch(/<botmux_reminder>[^<]*别因「无输出」提示重发[^<]*<\/botmux_reminder>/);
+    } finally {
+      delete (config as { noVisibleOutputHint?: boolean }).noVisibleOutputHint;
+    }
   });
 
   it('places the short whiteboard hint before follow-up user content', () => {
@@ -434,6 +633,7 @@ describe('buildReforkPrompt', () => {
     expect(out).not.toContain('<session_id>');
     expect(out).toContain('hello');
   });
+
 });
 
 // ─── renderSenderTag — <sender> attribute rendering / XML escape ────────────
@@ -457,6 +657,18 @@ describe('renderSenderTag', () => {
     expect(out).toContain('name="张三"');
   });
 
+  it('includes and XML-escapes the optional sender email', () => {
+    const out = renderSenderTag({
+      openId: 'ou_email',
+      type: 'user',
+      name: 'Alice',
+      email: 'alice&ops@example.com',
+    });
+    expect(out).toBe(
+      '<sender type="user" open_id="ou_email" name="Alice" email="alice&amp;ops@example.com" />',
+    );
+  });
+
   it('preserves bot type for foreign botmux peers', () => {
     const out = renderSenderTag({ openId: 'ou_b', type: 'bot', name: 'CoCo' });
     expect(out).toContain('type="bot"');
@@ -476,6 +688,95 @@ describe('renderSenderTag', () => {
     // And the tag's outer quotes are not eaten by inner ones.
     expect(out.startsWith('<sender ')).toBe(true);
     expect(out.endsWith(' />')).toBe(true);
+  });
+});
+
+// ─── senderTag switch — per-bot gate over the <sender> block ────────────────
+
+describe('senderTag switch', () => {
+  const sender = { openId: 'ou_gate1234567890', type: 'user' as const, name: '申晗' };
+
+  afterEach(() => { delete mockBotConfig.senderTag; });
+
+  it('injects the tag when senderTag is absent (default ON)', () => {
+    expect(renderSenderTag(sender, 'app_test')).toContain('open_id="ou_gate1234567890"');
+  });
+
+  it('injects the tag when senderTag is explicitly true', () => {
+    mockBotConfig.senderTag = true;
+    expect(renderSenderTag(sender, 'app_test')).toContain('<sender ');
+  });
+
+  it('suppresses the tag when senderTag is false', () => {
+    mockBotConfig.senderTag = false;
+    expect(renderSenderTag(sender, 'app_test')).toBe('');
+  });
+
+  it('ignores the switch when no larkAppId is supplied (synthetic callers)', () => {
+    mockBotConfig.senderTag = false;
+    // Without an appId there is no bot to consult, so behavior must stay exactly
+    // as it was before the switch existed.
+    expect(renderSenderTag(sender)).toContain('<sender ');
+  });
+
+  it('fails OPEN when the bot cannot be read', async () => {
+    const { getBot } = await import('../src/bot-registry.js');
+    vi.mocked(getBot).mockImplementationOnce(() => { throw new Error('unknown bot'); });
+    // A config-read failure must never silently strip per-turn attribution.
+    expect(renderSenderTag(sender, 'app_test')).toContain('<sender ');
+  });
+
+  it('drops the tag from a new-topic prompt when off, keeping every other block', () => {
+    mockBotConfig.senderTag = false;
+    const off = buildNewTopicPrompt(
+      '帮我看下', 'sess-1', 'claude-code', undefined, undefined, undefined,
+      undefined, undefined, undefined, 'zh', sender, { larkAppId: 'app_test', chatId: 'oc_1' },
+    );
+    expect(off).not.toContain('<sender ');
+    expect(off).toContain('<user_message>');
+
+    delete mockBotConfig.senderTag;
+    const on = buildNewTopicPrompt(
+      '帮我看下', 'sess-1', 'claude-code', undefined, undefined, undefined,
+      undefined, undefined, undefined, 'zh', sender, { larkAppId: 'app_test', chatId: 'oc_1' },
+    );
+    expect(on).toContain('<sender ');
+    // The ONLY difference is the sender block — nothing else shifts.
+    expect(on.replace(/\n*<sender [^>]*\/>/, '')).toBe(off);
+  });
+
+  it('drops the tag from a follow-up turn when off', () => {
+    mockBotConfig.senderTag = false;
+    const out = buildFollowUpContent('继续', 'sess-2', {
+      sender, larkAppId: 'app_test', chatId: 'oc_1', cliId: 'claude-code', locale: 'zh',
+    });
+    expect(out).not.toContain('<sender ');
+    expect(out).toContain('<user_message>');
+  });
+
+  it('drops the cursor anti-echo note together with the tag', () => {
+    // The note exists only to stop cursor echoing an inline tag. With no tag
+    // there is nothing to misread, so the note must go too.
+    mockBotConfig.senderTag = false;
+    const out = buildFollowUpContent('继续', 'sess-3', {
+      sender, larkAppId: 'app_test', chatId: 'oc_1', cliId: 'cursor', locale: 'zh',
+    });
+    expect(out).not.toContain('<sender ');
+    expect(out).not.toContain('<sender_note>');
+
+    delete mockBotConfig.senderTag;
+    const on = buildFollowUpContent('继续', 'sess-3', {
+      sender, larkAppId: 'app_test', chatId: 'oc_1', cliId: 'cursor', locale: 'zh',
+    });
+    expect(on).toContain('<sender ');
+    expect(on).toContain('<sender_note>');
+  });
+
+  it('gates the daemon buffered-follow-up path too', () => {
+    mockBotConfig.senderTag = false;
+    expect(renderBufferedSenderBlock(sender, 'cursor', 'zh', 'app_test')).toBe('');
+    delete mockBotConfig.senderTag;
+    expect(renderBufferedSenderBlock(sender, 'cursor', 'zh', 'app_test')).toContain('<sender ');
   });
 });
 
